@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  USB devices we want automatic access to (UVC cameras).
+  Matching an attach intent filter makes Android grant the USB permission
+  without the per-device dialog. Note that device_filter.xml cannot match on a
+  USB interface class or on a serial number, so unknown cameras are matched by
+  their IAD class below (broad: it also matches headsets and some hubs) and
+  otherwise need one "Allow" tap.
+-->
+<resources>
+    <!-- EPOS EXPAND Vision 1 -->
+    <usb-device vendor-id="5013" product-id="1536" />
+    <!-- generic UVC camera (3034:1313) -->
+    <usb-device vendor-id="3034" product-id="1313" />
+    <!-- any USB video class device (IAD) -->
+    <usb-device class="239" subclass="2" protocol="1" />
+</resources>

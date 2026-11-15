@@ -62,6 +62,32 @@ if(ANDROID)
     FetchContent_MakeAvailable(curl)
     target_link_libraries(wivrn libcurl_static)
 
+    # libusb: raw USB access for UVC cameras (Horizon OS has no kernel uvcvideo).
+    # The release tarballs ship no CMakeLists.txt, so compile the sources directly
+    # with the config.h provided for Android builds.
+    FetchContent_GetProperties(libusb)
+    if(NOT libusb_POPULATED)
+        FetchContent_Populate(libusb)
+    endif()
+    add_library(usb-1.0 STATIC
+        ${libusb_SOURCE_DIR}/libusb/core.c
+        ${libusb_SOURCE_DIR}/libusb/descriptor.c
+        ${libusb_SOURCE_DIR}/libusb/hotplug.c
+        ${libusb_SOURCE_DIR}/libusb/io.c
+        ${libusb_SOURCE_DIR}/libusb/strerror.c
+        ${libusb_SOURCE_DIR}/libusb/sync.c
+        ${libusb_SOURCE_DIR}/libusb/os/events_posix.c
+        ${libusb_SOURCE_DIR}/libusb/os/threads_posix.c
+        ${libusb_SOURCE_DIR}/libusb/os/linux_usbfs.c
+        ${libusb_SOURCE_DIR}/libusb/os/linux_netlink.c
+    )
+    target_include_directories(usb-1.0
+        SYSTEM PUBLIC ${libusb_SOURCE_DIR}/libusb
+        PRIVATE ${libusb_SOURCE_DIR}/android
+    )
+    target_compile_definitions(usb-1.0 PRIVATE HAVE_CONFIG_H PLATFORM_LINUX)
+    target_link_libraries(wivrn usb-1.0)
+
     target_link_libraries(wivrn native_app_glue)
     target_compile_definitions(wivrn PRIVATE -DXR_USE_PLATFORM_ANDROID -DVK_USE_PLATFORM_ANDROID_KHR)
     target_link_options(wivrn PRIVATE -Wl,--undefined=ANativeActivity_onCreate)
@@ -280,6 +306,10 @@ set(LICENSES_DIR "${ASSETS_DIR}/licenses")
 file(MAKE_DIRECTORY "${LICENSES_DIR}")
 file(COPY_FILE "${CMAKE_SOURCE_DIR}/COPYING" "${LICENSES_DIR}/WiVRn")
 file(COPY_FILE "${simdjson_SOURCE_DIR}/LICENSE" "${LICENSES_DIR}/simdjson")
+if (ANDROID AND EXISTS "${libusb_SOURCE_DIR}/COPYING")
+    # libusb is statically linked into the APK (LGPL-2.1)
+    file(COPY_FILE "${libusb_SOURCE_DIR}/COPYING" "${LICENSES_DIR}/libusb")
+endif()
 file(COPY_FILE "${CMAKE_SOURCE_DIR}/LICENSE-OFL-1.1" "${LICENSES_DIR}/FontAwesome")
 if (OPENXR_SOURCE_DIR)
     file(COPY_FILE "${OPENXR_SOURCE_DIR}/LICENSE" "${LICENSES_DIR}/openxr-loader")

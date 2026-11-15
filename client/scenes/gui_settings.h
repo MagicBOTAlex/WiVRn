@@ -21,6 +21,8 @@
 
 #include <functional>
 #include <optional>
+#include <string>
+#include <vector>
 
 class configuration;
 class imgui_context;
@@ -54,6 +56,17 @@ struct settings_context
 	std::function<void()> on_streaming_changed;          // refresh rate / spacewarp / bitrate
 	std::function<void()> enter_foveation_adjust;        // thumbstick foveation sub-mode
 	std::function<void()> on_foveation_override_changed; // foveation override toggled
+
+	// camera passthrough (in-stream only)
+	struct camera_entry_ui
+	{
+		std::string identity;
+		std::string label;
+		int device;   // /dev/videoN, or -1 when the PC has no device for it
+		bool exposed; // the server created a v4l2 node for this camera
+	};
+	std::function<std::vector<camera_entry_ui>()> get_cameras;
+	std::function<void(const std::string &, int)> set_camera_device;
 };
 
 void settings_video(const settings_context &);
@@ -61,6 +74,7 @@ void settings_streaming(const settings_context &);
 void settings_post_processing(const settings_context &);
 void settings_audio(const settings_context &);
 void settings_devices(const settings_context &);
+void settings_cameras(const settings_context &);
 bool settings_tracking(const settings_context &);
 void settings_system(const settings_context &);
 void settings_theme(const settings_context &);

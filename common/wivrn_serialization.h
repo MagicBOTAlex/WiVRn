@@ -267,6 +267,11 @@ public:
 		return buffer.empty();
 	}
 
+	size_t remaining() const
+	{
+		return buffer.size_bytes();
+	}
+
 	void check_remaining_size(size_t min_size) const
 	{
 		if (min_size > buffer.size_bytes())
@@ -684,6 +689,10 @@ struct serialization_traits<std::vector<T>>
 		}
 		else
 		{
+			// The length field comes from the wire: without this check a single
+			// malformed packet can make us reserve gigabytes.
+			if (size > packet.remaining())
+				throw deserialization_error(packet.initial_buffer);
 			value.reserve(size);
 			for (size_t i = 0; i < size; i++)
 			{

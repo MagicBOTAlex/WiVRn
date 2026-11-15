@@ -22,6 +22,9 @@
 #include "app_launcher.h"
 #include "application.h"
 #include "audio/audio.h"
+#ifdef __ANDROID__
+#include "android/camera.h"
+#endif
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
 #include "foveation.h"
@@ -34,11 +37,18 @@
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
 #include "xr/space.h"
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <string>
 #include <thread>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace scenes
@@ -156,6 +166,41 @@ private:
 
 	std::optional<audio> audio_handle;
 
+	// Camera passthrough state shared with the settings UI. Kept outside
+	// __ANDROID__ so the desktop client (which has no cameras) still compiles.
+	std::mutex camera_assignment_mutex;
+	std::vector<to_headset::camera_assignment::camera> camera_assignment;
+	std::vector<std::string> camera_attached; // identities currently plugged in
+
+#ifdef __ANDROID__
+	// External (USB) cameras streamed to the server
+	std::mutex camera_mutex;
+	// Declared before camera_captures so it is destroyed after them: captures may
+	// still push frames while they are being torn down.
+	struct camera_sender
+	{
+		std::mutex mutex;
+		std::condition_variable cv;
+		std::deque<from_headset::camera_frame> frames;
+		std::thread thread;
+		bool running = false;
+	};
+	std::shared_ptr<camera_sender> camera_send_queue;
+	std::mutex camera_send_mutex;
+	std::map<uint8_t, std::unique_ptr<android_camera::capture>> camera_captures;
+	std::map<uint8_t, std::string> camera_capture_identity; // identity per running capture
+	std::map<uint8_t, std::string> camera_identities;       // current USB topology
+	std::chrono::steady_clock::time_point last_camera_scan{};
+	// Set until the first camera_list of this session is sent, so a camera
+	// plugged in while disconnected is picked up after a reconnect.
+	bool camera_list_pending = true;
+	std::chrono::steady_clock::time_point camera_retry_at{};
+	void start_camera_sender();
+	void stop_camera_sender();
+	void scan_cameras();
+	void send_camera_frame(android_camera::frame &&);
+#endif
+
 	std::optional<xr::hand_tracker> left_hand;
 	std::optional<xr::hand_tracker> right_hand;
 	std::optional<input_profile> input;
@@ -185,6 +230,7 @@ private:
 		streaming,
 		post_processing,
 		devices,
+		cameras,
 		tracking,
 		theme,
 		system,
@@ -268,6 +314,8 @@ public:
 	void operator()(to_headset::tracking_control &&);
 	void operator()(to_headset::feature_control &&);
 	void operator()(to_headset::audio_stream_description &&);
+	void operator()(to_headset::camera_stream_description &&);
+	void operator()(to_headset::camera_assignment &&);
 	void operator()(to_headset::video_stream_description &&);
 	void operator()(to_headset::refresh_rate_change &&);
 	void operator()(to_headset::stream_tab_change &&);

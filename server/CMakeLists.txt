@@ -110,6 +110,9 @@ if (WIVRN_BUILD_SERVER)
 
 			audio/audio_setup.cpp
 
+			camera/camera_dump.cpp
+			camera/camera_v4l2.cpp
+
 			compositor/compositor.cpp
 			compositor/layer_squasher.cpp
 			compositor/foveation.cpp
@@ -153,6 +156,9 @@ if (WIVRN_BUILD_SERVER)
 
 	target_link_libraries(wivrn-server PRIVATE CLI11::CLI11 xrt-external-renderdoc)
 
+	# Camera sink: MJPEG decode for the USB camera passthrough
+	target_link_libraries(wivrn-server PRIVATE PkgConfig::LIBAV)
+
 	if (WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
 		target_include_directories(wivrn-server SYSTEM PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh/)
 		target_link_libraries(wivrn-server PRIVATE drv_steamvr_lh)
@@ -178,7 +184,7 @@ if (WIVRN_BUILD_SERVER)
 				encoder/ffmpeg/video_encoder_va.cpp
 				encoder/ffmpeg/ffmpeg_helper.cpp
 			)
-		target_link_libraries(wivrn-server PRIVATE PkgConfig::LIBAV PkgConfig::LIBDRM)
+		target_link_libraries(wivrn-server PRIVATE PkgConfig::LIBDRM)
 	endif()
 
 	if(WIVRN_USE_VULKAN_ENCODE)

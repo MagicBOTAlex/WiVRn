@@ -20,6 +20,7 @@
 #pragma once
 
 #include "app_pacer.h"
+#include "camera/camera_sink.h"
 #include "clock_offset.h"
 #include "compositor/compositor.h"
 #include "inplace_vector.hpp"
@@ -110,6 +111,10 @@ class wivrn_session : public xrt_system_devices
 	std::atomic<XrDuration> tracking_latency; // production to reception time
 
 	std::unique_ptr<audio_device> audio_handle;
+	std::unique_ptr<camera_sink> camera_handle;
+	std::vector<camera_entry> cameras; // currently attached, updated on hotplug
+	void send_camera_stream_description();
+	void send_camera_assignment();
 
 	// when sessions shall be destroyed, key is client id, value is timestamp
 	thread_safe<std::map<uint32_t, int64_t>> session_loss;
@@ -189,6 +194,9 @@ public:
 	void operator()(const from_headset::set_active_application &);
 	void operator()(const from_headset::stop_application &);
 	void operator()(audio_data &&);
+	void operator()(from_headset::camera_frame &&);
+	void operator()(from_headset::camera_list &&);
+	void operator()(from_headset::set_camera_device &&);
 
 	void operator()(to_monado::stop &&);
 	void operator()(to_monado::disconnect &&);

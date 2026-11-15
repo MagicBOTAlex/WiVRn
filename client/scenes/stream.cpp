@@ -29,6 +29,9 @@
 #define GLM_FORCE_RADIANS
 
 #include "stream.h"
+#ifdef __ANDROID__
+#include "android/permissions.h"
+#endif
 
 #include "application.h"
 #include "audio/audio.h"
@@ -342,6 +345,34 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 		info.passthrough = self->system.passthrough_supported() != xr::passthrough_type::none;
 		info.system_name = std::string(self->system.properties().systemName);
 
+#ifdef __ANDROID__
+		// External (USB) cameras are only visible with the CAMERA permission
+		if (not check_permission("android.permission.CAMERA"))
+		{
+			request_permission("android.permission.CAMERA", [](bool granted) {
+				spdlog::info("Camera permission {}", granted ? "granted" : "denied");
+			});
+		}
+		else if (auto cameras = android_camera::list_cameras(); cameras)
+		{
+			for (const auto & cam: *cameras)
+			{
+				self->camera_identities[static_cast<uint8_t>(cam.id)] = cam.identity;
+				info.cameras.push_back({
+				        .id = static_cast<uint8_t>(cam.id),
+				        .identity = cam.identity,
+				        .name = cam.name,
+				        // UVC cameras expose many sizes; the server asks for a size
+				        // and the client negotiates the closest one.
+				        .width = 1280,
+				        .height = 720,
+				        .max_frame_rate = 30,
+				});
+			}
+			spdlog::info("Advertising {} external camera(s)", info.cameras.size());
+		}
+#endif
+
 		audio::get_audio_description(info);
 		if (not(config.check_feature(feature::microphone)))
 			info.microphone = {};
@@ -611,6 +642,12 @@ scenes::stream::~stream()
 
 	if (network_thread.joinable())
 		network_thread.join();
+
+#ifdef __ANDROID__
+	// The captures may still be running (they are destroyed after this body), so
+	// stop the sender last; pushes after this point are dropped.
+	stop_camera_sender();
+#endif
 }
 
 void scenes::stream::push_blit_handle(shard_accumulator * decoder, std::shared_ptr<shard_accumulator::blit_handle> handle)

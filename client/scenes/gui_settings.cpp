@@ -25,6 +25,9 @@
 
 #include "gui_settings.h"
 
+#include <algorithm>
+#include <deque>
+
 #include "application.h"
 #include "configuration.h"
 #include "decoder/decoder.h"
@@ -32,6 +35,7 @@
 #include "render/ui_theme.h"
 #include "render/ui_widgets.h"
 #include "utils/i18n.h"
+#include "wivrn_packets.h"
 #include "xr/instance.h"
 #include "xr/session.h"
 #include "xr/system.h"
@@ -305,6 +309,68 @@ void settings_video(const settings_context & ctx)
 
 	ui::page_header(_cS("page header title", "Video"), _cS("page header subtitle", "Frame rate and resolution."));
 	render_settings(ctx, "##video", list);
+}
+
+void settings_cameras(const settings_context & ctx)
+{
+	ui::page_header(_cS("page header title", "Cameras"),
+	                _cS("page header subtitle", "USB cameras streamed from the headset to the PC."));
+
+	const auto cameras = ctx.get_cameras ? ctx.get_cameras() : std::vector<settings_context::camera_entry_ui>{};
+
+	if (cameras.empty())
+	{
+		ui::begin_card("##cameras_empty");
+		ImGui::TextWrapped("%s", _C("camera settings", "No cameras detected. Plug a UVC camera into the headset.").c_str());
+		ui::end_card();
+		return;
+	}
+
+	// Local storage for the widget ids: render_settings only reads them during this
+	// call, but the strings must not move while it does.
+	std::deque<std::string> ids;
+
+	std::vector<std::string> options;
+	for (int device = wivrn::camera_device_first; device <= wivrn::camera_device_last; device++)
+		options.push_back(std::to_string(device));
+
+	std::vector<setting> list;
+	for (const auto & cam: cameras)
+	{
+		ids.push_back("##camera_" + cam.identity);
+
+		std::string description = cam.identity;
+		if (not cam.exposed)
+			description += " - " + _C("camera settings", "not exposed by the PC");
+		else if (cam.device < wivrn::camera_device_first or cam.device > wivrn::camera_device_last)
+			description += " - /dev/video" + std::to_string(cam.device);
+
+		list.push_back({
+		        .id = ids.back().c_str(),
+		        .label = cam.label,
+		        .description = description,
+		        .ui = ui_kind::segmented,
+		        .get_int = [cam] {
+			        if (not cam.exposed or cam.device < wivrn::camera_device_first or cam.device > wivrn::camera_device_last)
+				        return -1;
+			        return cam.device - wivrn::camera_device_first; },
+		        .set_int = [ctx, cam](int v) {
+			        const int device = v + wivrn::camera_device_first;
+			        // Tapping the current device must not tear the node down.
+			        if (device == cam.device or not ctx.set_camera_device)
+				        return;
+			        ctx.set_camera_device(cam.identity, device); },
+		        .options = [options] { return options; },
+		        .enabled = [cam] { return cam.exposed; },
+		        .disabled_tooltip = _C("camera settings", "The PC has no v4l2loopback device for this camera."),
+		});
+	}
+
+	render_settings(ctx, "##cameras", list);
+
+	ui::begin_card("##cameras_note");
+	ImGui::TextWrapped("%s", _C("camera settings", "Each camera keeps its device across reboots and re-plugs, matched by USB serial.").c_str());
+	ui::end_card();
 }
 
 void settings_streaming(const settings_context & ctx)

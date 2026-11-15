@@ -55,6 +55,14 @@ public:
 		return *res;
 	}
 
+	// Same as env(), but returns null instead of asserting when the current
+	// thread has not been attached. Used by destructors, which may run on a
+	// thread that never touched JNI.
+	static JNIEnv * try_env()
+	{
+		return instance().jni_env;
+	}
+
 	static void setup_thread(JavaVM * vm)
 	{
 		auto & inst = instance();

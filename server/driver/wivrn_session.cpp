@@ -20,6 +20,9 @@
 
 #include "wivrn_session.h"
 
+#include <cmath>
+#include <set>
+
 #include "accept_connection.h"
 #include "application.h"
 #include "configuration.h"
@@ -115,6 +118,18 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 	{
 		U_LOG_E("Failed to register audio device: %s", e.what());
 		throw;
+	}
+
+	for (const auto & cam: get_info().cameras)
+		cameras.push_back({.id = cam.id, .identity = cam.identity, .name = cam.name});
+
+	try
+	{
+		camera_handle = camera_sink::create(get_info());
+	}
+	catch (const std::exception & e)
+	{
+		U_LOG_E("Failed to register camera device: %s", e.what());
 	}
 
 	static_roles.head = static_xdevs[static_xdev_count++] = &hmd;
@@ -423,6 +438,9 @@ void wivrn_session::pause_session()
 	if (audio_handle)
 		audio_handle->pause();
 
+	if (camera_handle)
+		camera_handle->pause();
+
 	// FIXME: pause compositor
 
 	// Rotate this connection's trace before it pauses for reconnect.
@@ -437,6 +455,11 @@ void wivrn_session::resume_session()
 
 	if (audio_handle)
 		audio_handle->resume();
+
+	if (camera_handle)
+		camera_handle->resume();
+
+	send_camera_stream_description();
 
 	// Tell the headset whether forwarded input devices are mirrored to uinput. The headset picks
 	// what to forward. The OpenXR gamepad at /user/gamepad is always available regardless.
@@ -993,6 +1016,149 @@ void wivrn_session::operator()(audio_data && data)
 {
 	if (audio_handle)
 		audio_handle->process_mic_data(std::move(data));
+}
+
+void wivrn_session::operator()(from_headset::camera_frame && frame)
+{
+	if (camera_handle)
+		camera_handle->process_frame(std::move(frame));
+}
+
+void wivrn_session::operator()(from_headset::camera_list && list)
+{
+	cameras.clear();
+	for (const auto & cam: list.cameras)
+		cameras.push_back({.id = cam.id, .identity = cam.identity, .name = cam.name});
+
+	// The sink is created at connection time only if a v4l2loopback device exists
+	// then. Retry here so a module loaded later (or a camera plugged in later)
+	// still works.
+	if (not camera_handle)
+	{
+		try
+		{
+			camera_handle = camera_sink::create(get_info());
+		}
+		catch (const std::exception & e)
+		{
+			U_LOG_E("Failed to create the camera sink: %s", e.what());
+		}
+	}
+
+	if (camera_handle)
+		camera_handle->update_cameras(cameras);
+
+	send_camera_stream_description();
+}
+
+void wivrn_session::operator()(from_headset::set_camera_device && change)
+{
+	if (not camera_handle)
+		return;
+
+	if (camera_handle->set_camera_device(change.identity, change.device))
+		U_LOG_I("Camera %s moved to /dev/video%u", change.identity.c_str(), unsigned(change.device));
+	else
+		U_LOG_W("Could not move camera %s to /dev/video%u", change.identity.c_str(), unsigned(change.device));
+
+	send_camera_assignment();
+}
+
+void wivrn_session::send_camera_assignment()
+{
+	if (not camera_handle)
+		return;
+
+	to_headset::camera_assignment assignment;
+	for (const auto & [identity, info]: camera_handle->assignment())
+		assignment.cameras.push_back({
+		        .identity = identity,
+		        .device = static_cast<uint8_t>(info.first),
+		        .label = info.second,
+		});
+
+	send_control(std::move(assignment));
+}
+
+void wivrn_session::send_camera_stream_description()
+{
+	// Debug aid: WIVRN_CAMERA_MOVE=<identity>:<device> applies one assignment at
+	// startup, so the mapping can be tested without touching the headset UI.
+	if (camera_handle)
+	{
+		static bool applied = false;
+		if (not applied)
+		{
+			applied = true;
+			if (const char * spec = getenv("WIVRN_CAMERA_MOVE"); spec and *spec)
+			{
+				const std::string move = spec;
+				const auto colon = move.rfind(':');
+				if (colon != std::string::npos)
+				{
+					const std::string identity = move.substr(0, colon);
+					const int device = atoi(move.c_str() + colon + 1);
+					if (camera_handle->set_camera_device(identity, device))
+						U_LOG_I("Camera %s moved to /dev/video%d (WIVRN_CAMERA_MOVE)", identity.c_str(), device);
+					else
+						U_LOG_W("Could not move camera %s to /dev/video%d (WIVRN_CAMERA_MOVE)", identity.c_str(), device);
+				}
+			}
+		}
+	}
+
+	to_headset::camera_stream_description desc;
+
+	if (not camera_handle)
+	{
+		// No v4l2loopback device: tell the headset to stop capturing instead of
+		// streaming frames that would be dropped.
+		send_control(std::move(desc));
+		return;
+	}
+
+	// Only ask for cameras that actually got a v4l2 node. Streaming a camera the
+	// PC could not bind wastes Wi-Fi, CPU and battery for nothing.
+	std::set<std::string> exposed;
+	for (const auto & [identity, info]: camera_handle->assignment())
+		exposed.insert(identity);
+
+	for (const auto & cam: cameras)
+	{
+		if (not exposed.contains(cam.identity))
+			continue;
+
+		// Match the advertised camera to get its preferred size
+		uint16_t width = 1280;
+		uint16_t height = 720;
+		float frame_rate = 30.f;
+		for (const auto & advertised: get_info().cameras)
+		{
+			if (advertised.identity == cam.identity)
+			{
+				width = std::clamp<uint16_t>(advertised.width, 16, 4096);
+				height = std::clamp<uint16_t>(advertised.height, 16, 4096);
+				if (std::isfinite(advertised.max_frame_rate))
+					frame_rate = std::clamp(advertised.max_frame_rate, 1.f, 60.f);
+				break;
+			}
+		}
+
+		desc.cameras.push_back({
+		        .id = cam.id,
+		        .width = width,
+		        .height = height,
+		        .frame_rate = frame_rate,
+		        .bitrate_bps = 4'000'000,
+		});
+	}
+
+	// Always send it: an empty list tells the headset to stop capturing, which is
+	// what has to happen when the last camera is unplugged.
+	U_LOG_I("Streaming %zu camera(s) from the headset", desc.cameras.size());
+	send_control(std::move(desc));
+
+	send_camera_assignment();
 }
 
 void wivrn_session::operator()(to_monado::stop &&)

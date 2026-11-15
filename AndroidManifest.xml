@@ -25,6 +25,12 @@
     </queries>
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Horizon OS gates UVC devices behind this one as well -->
+    <uses-permission android:name="horizonos.permission.USB_CAMERA" />
+
+    <!-- USB host mode, for UVC cameras -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <!-- Allow network access -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -150,6 +156,14 @@
                 <data android:scheme="wivrn" />
                 <data android:scheme="wivrn+tcp" />
             </intent-filter>
+
+            <!-- Automatic USB permission for UVC cameras (no dialog on attach) -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
     </application>
 </manifest>

@@ -153,6 +153,12 @@ void wivrn::TCP::init()
 		throw std::system_error{errno, std::generic_category()};
 	}
 
+	// Camera frames share this socket with control traffic. Without a send
+	// timeout a dead link makes sendmsg block for minutes, which also blocks
+	// teardown (the camera sender thread is joined).
+	timeval send_timeout{.tv_sec = 5, .tv_usec = 0};
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
 	mutex = std::make_unique<std::mutex>();
 }
 

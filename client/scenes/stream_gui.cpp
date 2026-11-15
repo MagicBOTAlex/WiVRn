@@ -18,6 +18,9 @@
  */
 
 #include "stream.h"
+#if defined(__ANDROID__) && !defined(NDEBUG)
+#include <sys/system_properties.h>
+#endif
 
 #include "application.h"
 #include "configuration.h"
@@ -418,6 +421,48 @@ void scenes::stream::gui_settings(float)
 		                .pitch = config.override_foveation_pitch,
 		                .distance = config.override_foveation_distance,
 		        }); },
+	        .get_cameras = [this]() {
+		        // Merge what is plugged in with what the PC exposes, so a camera that
+		        // the server could not bind still shows up (instead of a misleading
+		        // "no cameras detected").
+		        std::vector<wivrn::gui::settings_context::camera_entry_ui> result;
+		        std::lock_guard lock(camera_assignment_mutex);
+
+		        std::map<std::string, const to_headset::camera_assignment::camera *> exposed;
+		        for (const auto & cam : camera_assignment)
+			        exposed[cam.identity] = &cam;
+
+		        for (const auto & identity : camera_attached)
+		        {
+			        auto it = exposed.find(identity);
+			        if (it == exposed.end())
+			        {
+				        result.push_back({.identity = identity, .label = identity, .device = -1, .exposed = false});
+			        }
+			        else
+			        {
+				        result.push_back({.identity = identity, .label = it->second->label, .device = it->second->device, .exposed = true});
+				        exposed.erase(it);
+			        }
+		        }
+
+		        // Assigned cameras that are not plugged in right now are not shown:
+		        // the page is about what can be streamed.
+		        return result; },
+	        .set_camera_device = [this](const std::string & identity, int device) {
+		        if (device < wivrn::camera_device_first or device > wivrn::camera_device_last)
+			        return;
+		        try
+		        {
+			        network_session->send_control(from_headset::set_camera_device{
+			                .identity = identity,
+			                .device = static_cast<uint8_t>(device),
+			        });
+		        }
+		        catch (const std::exception & e)
+		        {
+			        spdlog::error("Failed to change camera device: {}", e.what());
+		        } },
 	};
 
 	switch (current_settings_page)
@@ -436,6 +481,9 @@ void scenes::stream::gui_settings(float)
 			break;
 		case settings_page::devices:
 			wivrn::gui::settings_devices(ctx);
+			break;
+		case settings_page::cameras:
+			wivrn::gui::settings_cameras(ctx);
 			break;
 		case settings_page::tracking:
 			if (wivrn::gui::settings_tracking(ctx))
@@ -621,8 +669,53 @@ void scenes::stream::gui_toasts()
 	ImGui::Text("%s", (*toast)->content.c_str());
 }
 
+#if defined(__ANDROID__) && !defined(NDEBUG)
+// UI development aid: `adb shell setprop debug.wivrn.ui cameras` opens that
+// settings page on start, so screenshots can be taken without touching the
+// headset. Debug builds only, and only once: the page must stay usable.
+static const std::string & debug_ui_page()
+{
+	static const std::string page = [] {
+		char value[PROP_VALUE_MAX] = {};
+		__system_property_get("debug.wivrn.ui", value);
+		return std::string(value);
+	}();
+	return page;
+}
+
+static bool debug_ui_applied = false;
+#endif
+
 void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period)
 {
+#if defined(__ANDROID__) && !defined(NDEBUG)
+	if (not debug_ui_applied and not debug_ui_page().empty())
+	{
+		debug_ui_applied = true;
+		next_gui_status = stream_tab::settings;
+
+		const auto & page_name = debug_ui_page();
+		if (page_name == "video")
+			current_settings_page = settings_page::video;
+		else if (page_name == "audio")
+			current_settings_page = settings_page::audio;
+		else if (page_name == "streaming")
+			current_settings_page = settings_page::streaming;
+		else if (page_name == "post_processing")
+			current_settings_page = settings_page::post_processing;
+		else if (page_name == "devices")
+			current_settings_page = settings_page::devices;
+		else if (page_name == "cameras")
+			current_settings_page = settings_page::cameras;
+		else if (page_name == "tracking")
+			current_settings_page = settings_page::tracking;
+		else if (page_name == "theme")
+			current_settings_page = settings_page::theme;
+		else if (page_name == "system")
+			current_settings_page = settings_page::system;
+	}
+#endif
+
 	if (auto new_status = next_gui_status.load(); new_status != gui_status)
 	{
 		spdlog::info("Switch tab from {} to {}", magic_enum::enum_name(gui_status), magic_enum::enum_name(new_status));
@@ -1028,6 +1121,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			settings_item(ICON_FA_TOWER_BROADCAST, _cS("tab label", "Streaming"), settings_page::streaming);
 			settings_item(ICON_FA_WAND_MAGIC_SPARKLES, _cS("tab label", "Post-processing"), settings_page::post_processing);
 			settings_item(ICON_FA_KEYBOARD, _cS("tab label", "Devices"), settings_page::devices);
+#ifdef __ANDROID__
+			// The desktop client has no cameras to show.
+			settings_item(ICON_FA_CAMERA, _cS("tab label", "Cameras"), settings_page::cameras);
+#endif
 			settings_item(ICON_FA_LOCATION_CROSSHAIRS, _cS("tab label", "Tracking"), settings_page::tracking);
 			settings_item(ICON_FA_GEARS, _cS("tab label", "System"), settings_page::system);
 			settings_item(ICON_FA_PALETTE, _cS("tab label", "Theme"), settings_page::theme);

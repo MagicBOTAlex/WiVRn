@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="760" viewBox="0 0 900 760">
+  <rect width="900" height="760" fill="#ffffff"/>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+    </marker>
+  </defs>
+
+  <g font-family="DejaVu Sans, sans-serif">
+    <!-- 1. camera -->
+    <rect x="170" y="30" width="560" height="78" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+    <text x="450" y="62" text-anchor="middle" font-size="22" font-weight="bold" fill="#1e1b4b">USB camera (UVC)</text>
+    <text x="450" y="88" text-anchor="middle" font-size="15" fill="#4338ca">MJPEG 1280x720 @ 30 fps</text>
+
+    <line x1="450" y1="112" x2="450" y2="148" stroke="#4b5563" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="466" y="136" font-size="13" fill="#6b7280">USB (isochronous or bulk)</text>
+
+    <!-- 2. headset -->
+    <rect x="170" y="152" width="560" height="86" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+    <text x="450" y="184" text-anchor="middle" font-size="22" font-weight="bold" fill="#1e1b4b">Quest 3 - userspace UVC stack</text>
+    <text x="450" y="208" text-anchor="middle" font-size="15" fill="#4338ca">libusb over the UsbManager fd - no root, no kernel driver</text>
+    <text x="450" y="228" text-anchor="middle" font-size="15" fill="#4338ca">descriptor parsing, probe/commit, frame reassembly</text>
+
+    <line x1="450" y1="242" x2="450" y2="278" stroke="#4b5563" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="466" y="266" font-size="13" fill="#6b7280">MJPEG passthrough, no re-encode</text>
+
+    <!-- 3. wifi -->
+    <rect x="170" y="282" width="560" height="78" rx="12" fill="#ecfeff" stroke="#0891b2" stroke-width="2"/>
+    <text x="450" y="314" text-anchor="middle" font-size="22" font-weight="bold" fill="#164e63">Wi-Fi - WiVRn control socket (TCP)</text>
+    <text x="450" y="340" text-anchor="middle" font-size="15" fill="#0e7490">one frame per packet, encrypted like every other WiVRn packet</text>
+
+    <line x1="450" y1="364" x2="450" y2="400" stroke="#4b5563" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="466" y="388" font-size="13" fill="#6b7280">MJPEG frames</text>
+
+    <!-- 4. server decode -->
+    <rect x="170" y="404" width="560" height="86" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+    <text x="450" y="436" text-anchor="middle" font-size="22" font-weight="bold" fill="#064e3b">wivrn-server (PC)</text>
+    <text x="450" y="460" text-anchor="middle" font-size="15" fill="#047857">libavcodec MJPEG decode, chroma subsample to 4:2:0</text>
+    <text x="450" y="480" text-anchor="middle" font-size="15" fill="#047857">full range to limited range conversion</text>
+
+    <line x1="450" y1="494" x2="450" y2="530" stroke="#4b5563" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="466" y="518" font-size="13" fill="#6b7280">V4L2 output (I420)</text>
+
+    <!-- 5. v4l2loopback -->
+    <rect x="170" y="534" width="560" height="86" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+    <text x="450" y="566" text-anchor="middle" font-size="22" font-weight="bold" fill="#064e3b">v4l2loopback - /dev/video10..17</text>
+    <text x="450" y="590" text-anchor="middle" font-size="15" fill="#047857">one node per camera, assigned by USB serial</text>
+    <text x="450" y="610" text-anchor="middle" font-size="15" fill="#047857">card label = "left eye", "right eye", ...</text>
+
+    <line x1="450" y1="624" x2="450" y2="660" stroke="#4b5563" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="466" y="648" font-size="13" fill="#6b7280">standard webcam interface</text>
+
+    <!-- 6. apps -->
+    <rect x="170" y="664" width="560" height="78" rx="12" fill="#fefce8" stroke="#ca8a04" stroke-width="2"/>
+    <text x="450" y="696" text-anchor="middle" font-size="22" font-weight="bold" fill="#713f12">OBS - browser - Zoom - anything</text>
+    <text x="450" y="722" text-anchor="middle" font-size="15" fill="#a16207">the cameras look like ordinary webcams to the PC</text>
+  </g>
+</svg>

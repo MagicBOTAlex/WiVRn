@@ -42,6 +42,11 @@ namespace wivrn
 
 static constexpr int protocol_revision = 1;
 
+// v4l2loopback devices the camera sink may expose (/dev/video<N>). Must match the
+// video_nr= module option; used by the server allocator and the headset settings.
+static constexpr int camera_device_first = 10;
+static constexpr int camera_device_last = 17;
+
 enum class device_id : uint8_t
 {
 	HEAD,                         // /user/head
@@ -350,6 +355,20 @@ struct headset_info_packet
 	};
 	std::optional<audio_description> speaker;
 	std::optional<audio_description> microphone;
+
+	// External cameras available on the headset (USB/UVC), streamed to the server
+	struct camera_description
+	{
+		uint8_t id;
+		// Stable identity (USB serial number, or vid:pid fallback), used by the
+		// server to map a physical camera to a fixed output device.
+		std::string identity;
+		std::string name;
+		uint16_t width;
+		uint16_t height;
+		float max_frame_rate;
+	};
+	std::vector<camera_description> cameras;
 	bool battery_status; // supports XR_EXT_interaction_profile_battery_state_display, for reporting controller/gamepad battery status
 	bool hand_tracking;
 	bool eye_gaze;
@@ -725,6 +744,42 @@ struct stop_application
 	uint32_t id;
 };
 
+// Sent at connection and whenever a camera is plugged or unplugged.
+struct camera_list
+{
+	struct camera
+	{
+		uint8_t id;
+		std::string identity;
+		std::string name;
+	};
+	std::vector<camera> cameras;
+};
+
+// Change the v4l2 device a physical camera is exposed on.
+struct set_camera_device
+{
+	std::string identity;
+	uint8_t device;
+};
+
+struct camera_frame
+{
+	// Index of the camera, as advertised in headset_info_packet
+	uint8_t camera_id;
+	// Counter increased for each frame of this camera
+	uint64_t frame_idx;
+	// ns in headset time referential
+	XrTime timestamp;
+	// True when the payload is independently decodable (always true for MJPEG)
+	bool keyframe;
+	// One complete MJPEG (JPEG) image
+	std::span<uint8_t> payload;
+
+	// Container for the data, read payload instead
+	data_holder data;
+};
+
 // when changing this, also make sure there are handlers in wivrn_session, etc. or compilation will fail
 using packets = std::variant<
         crypto_handshake,
@@ -756,7 +811,10 @@ using packets = std::variant<
         set_active_application,
         hid::input,
         stop_application,
-        foveation>;
+        foveation,
+        camera_frame,
+        camera_list,
+        set_camera_device>;
 } // namespace from_headset
 
 namespace to_headset
@@ -970,6 +1028,39 @@ struct running_applications
 	std::vector<application> applications;
 };
 
+// Current camera -> v4l2 device assignment, shown in the headset settings.
+struct camera_assignment
+{
+	struct camera
+	{
+		std::string identity;
+		uint8_t device;
+		std::string label;
+
+		bool operator==(const camera &) const = default;
+	};
+	std::vector<camera> cameras;
+};
+
+struct camera_stream_description
+{
+	struct camera
+	{
+		uint8_t id;
+		uint16_t width;
+		uint16_t height;
+		float frame_rate;
+		uint32_t bitrate_bps;
+
+		bool operator==(const camera &) const = default;
+	};
+
+	// Cameras to capture. An empty list disables all cameras.
+	std::vector<camera> cameras;
+
+	bool operator==(const camera_stream_description &) const = default;
+};
+
 using packets = std::variant<
         crypto_handshake,
         pin_check_2,
@@ -988,7 +1079,9 @@ using packets = std::variant<
         stream_tab_change,
         application_list,
         application_icon,
-        running_applications>;
+        running_applications,
+        camera_stream_description,
+        camera_assignment>;
 } // namespace to_headset
 } // namespace wivrn
 

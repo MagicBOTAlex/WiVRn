@@ -1,230 +1,361 @@
-<h1 align="center"> WiVRn </h1>
+<h1 align="center">WiVRn &mdash; USB camera passthrough fork</h1>
 
-<div align="center">
-  
-[![License: GPL v3](images/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) ![CI](https://github.com/WiVRn/WiVRn/workflows/Build/badge.svg) ![Format](https://github.com/WiVRn/WiVRn/workflows/Format/badge.svg)
-  
-</div>
-<p align="center"><img src="images/wivrn.svg" width="180"></p>
-<h3 align="center">Fully FOSS PCVR streamer</h3>
+<p align="center"><img src="images/wivrn.svg" width="140"></p>
 
-# About
+This is a fork of [WiVRn](https://github.com/WiVRn/WiVRn) that adds **USB (UVC)
+camera passthrough from the headset to the PC**.
 
-WiVRn is an application that wirelessly streams a virtual reality game to a standalone VR headset from a <b>Linux</b> computer.
+Plug a webcam into a Meta Quest 3, and it shows up on the Linux PC as
+`/dev/video10` (or 11, 12, ...) through
+[v4l2loopback](https://github.com/v4l2loopback/v4l2loopback). Any application that
+can use a webcam (OBS, Firefox, Chrome, Zoom, Discord, ...) sees it, over Wi-Fi,
+while the headset is streaming.
 
-WiVRn support a wide range of VR devices:
+No root, no custom kernel, no Camera2: the headset has no `uvcvideo` driver, so
+the cameras are driven from userspace with libusb.
 
-| Headset | Supported | Notes |
-|:--------:|:--------:|:--------:|
-| Quest 1 | ✓ |  |
-| Quest 2 | ✓ |  |
-| Quest 3 | ✓ |  |
-| Quest 3s | ✓ |  |
-| Quest Pro | ✓ |  |
-| Pico Neo 3 | ✓ |  |
-| Pico 4 | ✓ |  |
-| HTC Vive Focus 3 | ✓ | Laggy | 
-| HTC Vive XR Elite | ✓ | Laggy |
-| Samsung Galaxy XR | ✓ |  |
-| Other Android VR | ? | Cannot know |
-| Play for Dream | ✖ | https://github.com/WiVRn/WiVRn/issues/465 |
-| Non-Android VR | ✖ | Not Android |
-| Non-VR Android | ✖ | VR required |
+Everything upstream still works; this fork only adds the camera feature (plus a
+small amount of plumbing in the WiVRn protocol and settings UI).
 
-<sup>A Linux client does exist, only for debugging. It has no audio or hardware decoding.</sup>
+---
 
-# Getting started
+## What it looks like
 
+`Settings -> Cameras` in the in-stream WiVRn menu: each physical camera keeps a
+fixed `/dev/videoN`, matched by USB serial, and the mapping is persisted.
 
-## PC Server/Dashboard
+![Cameras settings tab](docs/camera-settings.png)
 
-We recommend using native packages if available for your distribution:
-- [Arch User Repository](https://aur.archlinux.org/packages/wivrn-dashboard)
-- [Fedora](https://packages.fedoraproject.org/pkgs/wivrn/wivrn/)
-- [Gentoo Guru](https://gitweb.gentoo.org/repo/proj/guru.git/tree/media-libs/wivrn)
-- [NixOS](https://search.nixos.org/packages?show=wivrn)
-- [Ubuntu PPA](https://launchpad.net/~lvra/+archive/ubuntu/wivrn)
+Two cameras streaming into `/dev/video10` and `/dev/video11` at the same time:
 
-For OpenVR and Steam compatibility, you also need a compatibility library such as [xrizer](https://github.com/Supreeeme/xrizer/) or [OpenComposite](https://gitlab.com/znixian/OpenOVR/).
+```console
+$ ffprobe -v error -f v4l2 -i /dev/video10 -show_entries stream=width,height -of csv=p=0
+1280,720
+$ ffprobe -v error -f v4l2 -i /dev/video11 -show_entries stream=width,height -of csv=p=0
+1280,720
+```
 
-A Flatpak is available on Flathub for all distributions:
+Server log while both are running:
 
-[![Flathub](https://flathub.org/api/badge)](https://flathub.org/apps/io.github.wivrn.wivrn)
+```console
+INFO [load_camera_config] Loaded 2 camera assignment(s) from cameras.json
+INFO [update_cameras] Camera 200901010001 (right eye) -> /dev/video11
+INFO [update_cameras] Camera A007240223000154 (left eye) -> /dev/video10
+INFO [send_camera_stream_description] Streaming 2 camera(s) from the headset
+INFO [configure] Camera 0: streaming 1280x720 I420 (stride 1280) to /dev/video11
+INFO [configure] Camera 1: streaming 1280x720 I420 (stride 1280) to /dev/video10
+```
 
-The Flatpak contains both xrizer and OpenComposite.
+---
 
-Note that due to Flatpak sandboxing, some features such as support for SteamVR tracked (Lighthouse) devices, or virtual gamepad/keyboard/input devices forwarded from the headset, may not be available.
+## Pipeline
 
-## Headset Client/App
+![Pipeline](docs/camera-pipeline.png)
 
-Follow the wizard in the PC dashboard to install the client on your VR headset.
+```
+USB camera (MJPEG)
+  -> Quest 3: userspace UVC over libusb (UsbManager fd, no root)
+  -> WiVRn control socket over Wi-Fi (MJPEG frames, encrypted like every packet)
+  -> wivrn-server: libavcodec MJPEG -> I420, full range -> limited range
+  -> v4l2loopback /dev/video10..17
+  -> OBS / browser / Zoom / anything
+```
 
-It should either lead you to the [Meta Store](https://www.meta.com/experiences/7959676140827574/) (for Meta Quest headsets) or to download the correct APK (for other headsets).
+### Why userspace UVC?
 
-> [!WARNING]
-> The VR client and PC server need to be on the same version of WiVRn
+| Attempt | Result |
+|---|---|
+| Camera2 API | Only exposes Quest *virtual* cameras; the UVC cameras are invisible |
+| Kernel `uvcvideo` | `CONFIG_MEDIA_USB_SUPPORT` is not set in the Quest kernel, and there is no root to change it |
+| PipeWire `Video/Source` on the PC | Crashed inside PipeWire's own `videoconvert` during negotiation |
+| **libusb over the UsbManager fd** | **Works**, no root, no kernel changes |
 
-> [!TIP]
-> If the headset fails to connect to the computer, see [troubleshooting](#troubleshooting).
+The camera stream is MJPEG all the way through: it is never decoded on the
+headset and never re-encoded, so the CPU cost on the Quest is just USB reads and
+a memcpy.
 
+---
 
+## Requirements
 
-# Usage
+**Headset**
+
+- Meta Quest 3 (Horizon OS / Android 14). Other Android headsets may work; the
+  USB permission names below are Meta-specific.
+- `android.permission.CAMERA` and `horizonos.permission.USB_CAMERA`.
+  Both are declared by the app; grant them with `adb shell pm grant` (see below).
+  Without the second one, `UsbManager.requestPermission()` is denied with no
+  dialog for any UVC device.
+- A UVC camera that exposes **MJPEG**. YUYV-only cameras are rejected (see
+  [Limitations](#limitations)).
+
+**PC**
+
+- Linux with `v4l2loopback`.
+- `libavcodec`/`libavutil` (the server links them for MJPEG decode).
+- WiVRn's usual dependencies.
+
+### v4l2loopback setup
+
+The sink uses `/dev/video10` .. `/dev/video17`. Load the module with enough
+devices for the number of cameras you have, and `exclusive_caps=1` **per device**
+(otherwise only the first node accepts readers):
+
+```nix
+# NixOS: /etc/nixos/modules/obs.nix (or wherever you configure kernel modules)
+boot.extraModprobeConfig = ''
+  options v4l2loopback exclusive_caps=1,1,1,1,1,1,1,1 video_nr=10,11,12 card_label="WiVRn camera 0,WiVRn camera 1,WiVRn camera 2"
+'';
+```
+
+On a non-NixOS distribution the equivalent is
+`/etc/modprobe.d/v4l2loopback.conf` with the same `options` line.
+
+`card_label` is only the default name; once a camera is assigned, the label comes
+from `cameras.json` (e.g. "left eye").
+
+---
+
+## Building
+
+### Server
+
+```bash
+cd WiVRn
+nix develop --command bash -c 'cmake -B build-server . -GNinja \
+  -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_DASHBOARD=OFF'
+nix develop --command bash -c 'cmake --build build-server -j$(nproc)'
+```
+
+The camera sink needs `libavcodec` regardless of which video encoder is selected,
+so `WIVRN_USE_VAAPI=OFF` (NVENC-only builds) works too.
+
+### Headset APK
+
+On NixOS the Android SDK/NDK come from `android-nixpkgs`; see
+[`building.md`](docs/building.md) for the general toolchain notes. For this
+environment the wrapper is `.build/shell.nix` in the parent directory:
+
+```bash
+cd WiVRn
+nix-shell ../.build/shell.nix --run './gradlew --no-daemon assembleDebug'
+adb install -r build/outputs/apk/debug/WiVRn-debug.apk
+adb shell pm grant org.meumeu.wivrn.local android.permission.CAMERA
+adb shell pm grant org.meumeu.wivrn.local horizonos.permission.USB_CAMERA
+```
+
+libusb is built from source and statically linked into the APK; its licence is
+copied into the app's licence directory like the other third-party libraries.
+
+---
 
 ## Running
 
-### Prerequisites
-Avahi must be running:
-```bash
-systemctl enable --now avahi-daemon
-```
-
-On SteamOS, the Avahi configuration needs to be modified to allow user services such as WiVRn to publish services on the network; see https://github.com/WiVRn/WiVRn/issues/1001#issuecomment-4940906113 for instructions on how to do so.
-
-- If a firewall is installed, open port 5353/UDP for Avahi and ports 9757/UDP+TCP for WiVRn.
-- For example, if using UFW run `ufw allow 5353/udp` and `ufw allow 9757`.
-
-### Start the PC server process
-The graphical frontend is listed as "WiVRn server" in the application list, and is `wivrn-dashboard` on command line. On first start, a wizard will guide you through the initial steps.
-
-The actual server for headless usage is `wivrn-server`. When installed through your distribution's package manager, a systemd user service named `wivrn` is also installed, which can be enabled to automatically start on login with `systemctl --user enable --now wivrn`.
-
-For Steam games, depending on the installation method, you may need to set launch options in the Steam properties for each game you want to run. Either the dashboard or command line output will display the launch command if it is required.
-
-### Start the headset application
-On the headset, when installed from the store, simply start `WiVRn`. If you installed the app via the dashboard, or manually via `adb`, it will be in an "unknown sources" section.
-
-On first start, it will ask if you want to enable some features such as microphone, hand tracking, eye tracking, etc., as they will require permissions to be granted. It is possible to grant those later from the Settings tab.
-
-It is highly recommended to use default settings and only tweak them if you experience issues.
-
-### Connect to the server
-The headset application will start on a server list. Your computer should be visible and have a connect button. Simply click it to start streaming.
-
-When the headset is connected, wivrn-server sets the OpenXR and OpenVR configuration to use WiVRn. Thus, applications will only be able to run in VR once the headset connection is established. The configuration is reverted once the connection ends and all running VR applications are closed. 
-
-The headset connection also triggers the creation of a virtual speaker and, if enabled in the headset app settings, a microphone. You will have to set them as the default output and input devices in your system audio configuration. This setting persists to future sessions until you change the defaults to other devices.
-
-### Start an application
-When the headset is connected and no XR application is running, it will show an application launcher. Applications in that list are sourced from:
-- Steam games that are flagged as VR. Steam may need to be restarted for the list to be updated when new games are installed.
-- .desktop files that contain `X-WiVRn-VR` in the `Categories` section. Files are searched in [standard locations](https://specifications.freedesktop.org/desktop-entry/latest/file-naming.html#desktop-file-id) which usually include `~/.local/share/applications` and `/usr/share/applications/`.
-
-You can set an application to be started automatically when your headset is connected, in the dashboard settings or [manually](docs/configuration.md#application).
-
-## Steam Flatpak
-Flatpak applications are only able to access the Flatpak version of WiVRn.
-
-If you're using the Steam Flatpak, you'll need to grant read only access to the following paths:
+Start the server:
 
 ```bash
-flatpak override \
-  --filesystem=xdg-run/wivrn:ro \
-  --filesystem=xdg-data/flatpak/app/io.github.wivrn.wivrn:ro \
-  --filesystem=/var/lib/flatpak/app/io.github.wivrn.wivrn:ro \
-  --filesystem=xdg-config/openxr:ro \
-  --filesystem=xdg-config/openvr:ro \
-  com.valvesoftware.Steam
+cd WiVRn
+nix develop --command bash -c \
+  'export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH; ./build-server/server/wivrn-server'
 ```
 
-When using a user installation of flatpak Steam, use `override --user` instead of `override`.
+Connect the headset. First time, enable pairing from the PC and put the PIN in
+the URI:
 
-The same overrides should work for other VR applications distributed as Flatpaks.
+```bash
+gdbus call --session --dest io.github.wivrn.Server --object-path /io/github/wivrn/Server \
+  --method io.github.wivrn.Server.EnablePairing 300
+adb shell am start -a android.intent.action.VIEW \
+  -d "wivrn://:PIN@192.168.50.58:9757" \
+  -n org.meumeu.wivrn.local/org.meumeu.wivrn.MainActivity
+```
 
-# Building
+Afterwards:
 
-See [building](docs/building.md) for building the [dashboard](docs/building.md#dashboard), [server (PC)](docs/building.md#server-pc), and [client (headset)](docs/building.md#client-headset)
+```bash
+adb shell am start -a android.intent.action.VIEW \
+  -d "wivrn://192.168.50.58:9757" \
+  -n org.meumeu.wivrn.local/org.meumeu.wivrn.MainActivity
+```
 
+Check the cameras on the PC:
 
-# Configuration
-Most settings are controlled through the headset app, while the server has configuration for items that are specific to the server. Use the dashboard to edit the latter, or see [configuration](docs/configuration.md) for editing it manually.
+```bash
+ffmpeg -f v4l2 -i /dev/video10 -frames:v 1 out.jpg
+```
 
-# Troubleshooting
-<details><summary>My computer is not seen by the headset</summary>
+### First plug-in
 
-If the server list is empty in the headset app:
-- Make sure your computer is connected on the same network as your headset
-- Check that avahi is running with `systemctl status avahi-daemon`, if it is not, enable it with `systemctl enable --now avahi-daemon`
-- If you have a firewall, check that port 5353 (UDP) is open</details>
+The app declares a `USB_DEVICE_ATTACHED` intent filter with
+`res/xml/device_filter.xml`, so Android grants USB access automatically for the
+known cameras. For an unknown camera, one "Allow" (choose **Always**) is needed
+the first time; after that a replug does not prompt.
 
-<details><summary>My headset does not connect to my computer</summary>
-  
-- If you have a firewall, check that port 9757 (UDP and TCP) is open
-- The server and client must be the same version.</details>
+If access is denied, the camera is simply not advertised to the PC (the app does
+not re-open a permission dialog every two seconds).
 
-<details><summary>How do I use a wired connection manually?</summary>
+---
 
-- Make sure the WiVRn Server is installed and running on your computer
-- Make sure you have the WiVRn app installed on your headset
-- After starting the "WiVRn Server" on your computer and ensuring your device is connected to your PC via cable, run the following in your terminal (Note: using `adb` on some devices may require developer mode to be enabled):
-   - ```bash
-      adb reverse tcp:9757 tcp:9757
-      adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost" org.meumeu.wivrn
-      ```
-   - Depending on your install type, you may need to replace `org.meumeu.wivrn` (Meta Store install) with:
-      - `org.meumeu.wivrn.github` for [releases](https://github.com/WiVRn/WiVRn/releases) on Github
-      - `org.meumeu.wivrn.github.nighly` for Github nightlies (wirvn-apk [repository](https://github.com/WiVRn/WiVRn-APK/releases))
-      - `org.meumeu.wivrn.github.testing` for Github CI builds
-      - `org.meumeu.wivrn.local` for developer builds
-- You can now continue the pairing process as documented in the running section.</details>
+## Camera assignment
 
-<details><summary>How do I see server logs when using the dashboard?</summary>
+A camera is identified by its **USB serial number**, falling back to `vid:pid`
+(and to `vid:pid@bus-path` if two cameras report the same serial). The mapping is
+stored in:
 
-- Click **Troubleshoot > Open server logs**
-- Or, navigate to `${XDG_STATE_HOME}/wivrn/wivrn-dashboard`
-  - In other words, on common setups, the dashboard writes logs to `~/.local/state/wivrn/wivrn-dashboard`
-  - For WiVRn Flatpak, the dashboard writes logs to `~/.var/app/io.github.wivrn.wivrn/.local/state/wivrn/wivrn-dashboard`</details>
+```
+$XDG_CONFIG_HOME/wivrn/cameras.json    (or ~/.config/wivrn/cameras.json)
+```
 
-<details><summary>My NVIDIA GPU P-State is limited to P2 instead of reaching the highest P0 while using the NVIDIA NVENC encoder</summary>
-    
-- See [nvenc](docs/nvenc.md) for troubleshooting.</details>
+```json
+{
+  "cameras": [
+    { "identity": "A007240223000154", "device": 10, "label": "left eye" },
+    { "identity": "200901010001",     "device": 11, "label": "right eye" }
+  ]
+}
+```
 
-<details><summary>I have high motion latency, black borders following my view, hear corrupted audio or see a corrupted, pixelated image</summary>
+- Unlisted cameras get the first free loopback device.
+- The label becomes the v4l2 card name, which is what applications display.
+- The file is written atomically (temp file + rename), so a crash cannot lose it.
+- Device numbers are validated against 10..17 and must be v4l2loopback output
+  devices.
 
-- When connecting through USB, make sure the headset isn't connected through WiFi (switch off WiFi)
-- Reset the settings using the button at the bottom of the settings tab
-- Try switching to software encoding
-- Decrease the bitrate
-- Decrease the resolution in the WiVRn app
-- Connect through USB or use a better WiFi router.
+### Changing it from the headset
 
-Note: WiVRn isn't properly optimized for NVIDIA GPUs due to the lack of developers with NVIDIA hardware. Motion latency may be significantly worse at rendering resolutions higher than default.</details>
+`Settings -> Cameras` lists every attached camera with a segmented picker for
+`/dev/video10` .. `/dev/video17`. Picking a device sends a `set_camera_device`
+packet; the server builds the new node, swaps it in, persists `cameras.json`, and
+replies with the new assignment. If the move fails, the old node keeps running.
 
-# Community Support
+### Changing it from the PC
 
-We are available on either **Discord** or **Matrix space**:
+There is no dashboard page yet. Edit `cameras.json` and restart the server, or
+use the debug hook described below.
 
-[![LVRA Discord](https://img.shields.io/discord/1065291958328758352?style=for-the-badge&logo=discord)](https://discord.gg/EHAYe3tTYa) [![LVRA Matrix](https://img.shields.io/matrix/linux-vr-adventures:matrix.org?logo=matrix&style=for-the-badge)](https://matrix.to/#/#linux-vr-adventures:matrix.org)
+---
 
-Please use the `wivrn` chat room for questions or issues specific to WiVRn.
+## Hotplug and reconnects
 
+- The headset scans the USB topology every 2 s on the network thread (not the
+  render thread, which stops when the headset is idle).
+- Unplugging a camera stops its capture and tells the server, which removes the
+  v4l2 node and re-sends the description.
+- Re-plugging recovers in a few seconds, on the same `/dev/videoN`, with no user
+  interaction.
+- A capture that stops delivering for 3 s is treated as dead and restarted; a
+  camera that starts but never delivers backs off by 3 s instead of being torn
+  down on every scan.
+- A camera plugged in while the headset was disconnected is picked up on the next
+  session: the client sends its camera list once at the start of each session.
 
-# Contributing
+---
 
-## Translations
+## Debugging
 
-See [translating](docs/translating.md) for procedure.
+| Variable / property | Effect |
+|---|---|
+| `WIVRN_CAMERA_DUMP=/tmp/dump` (server) | Write the raw MJPEG of each camera to `/tmp/dump-<id>.mjpg` instead of v4l2loopback. Each file is a concatenation of JPEG images. |
+| `WIVRN_CAMERA_MOVE=<identity>:<device>` (server) | Apply one assignment at startup, e.g. `WIVRN_CAMERA_MOVE=A007240223000154:12`. It goes through the same code path as the settings UI and persists the result. |
+| `adb shell setprop debug.wivrn.ui cameras` | **Debug builds only.** Open that settings page on start (`video`, `audio`, `streaming`, `post_processing`, `devices`, `cameras`, `tracking`, `theme`, `system`). Applied once; clear it with `adb shell setprop debug.wivrn.ui '""'`. |
 
+### Colour
 
-# Credits
-WiVRn uses the following software:
-- [ambientCG](https://ambientcg.com/)
-- [Avahi](https://www.avahi.org/)
-- [Boost.Locale](https://github.com/boostorg/locale)
-- [Boost.PFR](https://github.com/boostorg/pfr)
-- [CLI11](https://github.com/CLIUtils/CLI11)
-- [Dear ImGui](https://github.com/ocornut/imgui)
-- [fastgltf](https://github.com/spnda/fastgltf)
-- [ffmpeg](https://ffmpeg.org/) optional, for hardware encoding on AMD/Intel
-- [FreeType](https://freetype.org/)
-- [glm](http://glm.g-truc.net/)
-- [HarfBuzz](https://harfbuzz.github.io/)
-- [librsvg](https://wiki.gnome.org/Projects/LibRsvg)
-- [Monado](https://monado.freedesktop.org/)
-- [nvenc](https://developer.nvidia.com/nvidia-video-codec-sdk) optional, for hardware encoding on NVIDIA
-- [qCoro](https://qcoro.dev/)
-- [Qt 6](https://www.qt.io/) optional, for the dashboard
-- [spdlog](https://github.com/gabime/spdlog)
-- [VulkanMemoryAllocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)
-- [WebXR input profiles](https://www.npmjs.com/package/@webxr-input-profiles/motion-controllers)
-- [x264](https://www.videolan.org/developers/x264.html) optional, for software encoding
+MJPEG decodes to full-range YUV (`yuvj420p`/`yuvj422p`, sometimes 4:4:4). YUV420
+consumers assume **limited** range unless told otherwise, and several ignore the
+v4l2 quantization tag, so the sink converts full -> limited once and tags the
+buffer as limited BT.601. Verified by comparing the RGB means of the camera's own
+JPEG with a frame read from the v4l2 node (both `18.0` on the same static scene).
+
+Chroma is subsampled correctly for 4:2:0, 4:2:2 and 4:4:4 sources.
+
+---
+
+## How it is implemented
+
+### Protocol (`common/wivrn_packets.h`)
+
+| Direction | Packet | Purpose |
+|---|---|---|
+| headset -> PC | `camera_frame` | One complete MJPEG image (`camera_id`, `frame_idx`, timestamp, payload) |
+| headset -> PC | `camera_list` | Attached cameras (id, identity, name), sent on connect and on hotplug |
+| headset -> PC | `set_camera_device` | Move an identity to another `/dev/videoN` |
+| PC -> headset | `camera_stream_description` | Cameras to capture (empty list = stop all) |
+| PC -> headset | `camera_assignment` | Current identity -> device + label, for the settings page |
+| both | `headset_info_packet::cameras` | Cameras advertised at connection time |
+
+The protocol hash covers every field, so a mixed old/new pair fails the handshake
+with "Incompatible server version" rather than misbehaving.
+
+### Client
+
+| File | Role |
+|---|---|
+| `client/java/UsbCamera.java` | UsbManager enumeration, permissions, `openUsb(identity)` -> usbfs fd. Keyed by identity, one receiver for the process, only video interfaces claimed. |
+| `client/android/uvc.{h,cpp}` | Userspace UVC: descriptor parsing, `VS_PROBE`/`VS_COMMIT`, iso + bulk transfers, MJPEG frame reassembly. |
+| `client/android/camera.{h,cpp}` | JNI bridge (class loaded through the activity's class loader) and the frame queue. |
+| `client/scenes/stream_network.cpp` | Camera list/description handling, capture ownership by identity, a dedicated sender thread with a 2-frame drop-oldest queue. |
+| `client/scenes/gui_settings.cpp` | The Cameras settings page. |
+
+Notable details:
+
+- **Bulk framing.** A bulk URB can contain several UVC payloads and a payload can
+  span several URBs, so the parser keeps payload state across URBs. The
+  negotiated `dwMaxPayloadTransferSize` counts the header, and the URB is sized to
+  it. The EPOS camera needs 64 KB transfers; 8 KB produced torn frames.
+- **Isochronous size.** The USB2 high-bandwidth multiplier is applied, and the
+  USB3 companion descriptor's `wBytesPerInterval` is used when present.
+- **FID fallback.** If a camera never sets EOF (common when two streams run at
+  once), a FID toggle also ends the frame instead of discarding it.
+- **Liveness.** A stream that has not delivered a frame for 3 s (including "never
+  delivered") is considered dead and restarted.
+- **Teardown.** The dup'ed usbfs fd is closed after `libusb_close`, transfers are
+  freed only after the event thread has exited, and frames are delivered from a
+  separate thread so the libusb callback never runs blocking network code.
+
+### Server
+
+| File | Role |
+|---|---|
+| `server/camera/camera_sink.h` | Sink interface (`process_frame`, `update_cameras`, `set_camera_device`, `assignment`) |
+| `server/camera/camera_v4l2.{h,cpp}` | MJPEG decode, chroma conversion, v4l2loopback output, assignment + persistence |
+| `server/camera/camera_dump.cpp` | Sink factory; `WIVRN_CAMERA_DUMP` debug sink |
+| `server/driver/wivrn_session.cpp` | Creates the sink, forwards frames, sends descriptions/assignments |
+
+The v4l2 node is opened `O_NONBLOCK`; a slow consumer means "drop this frame",
+not "block the whole session". `VIDIOC_S_FMT` is always read back with
+`VIDIOC_G_FMT` and every write is checked against the mapped buffer, because a
+driver may clamp the format.
+
+---
+
+## Limitations
+
+- **MJPEG only.** Cameras without an MJPEG format are rejected at capture start
+  with a clear log message. Supporting YUYV would need an encoder or a raw path.
+- **Camera frames share the TCP control socket** with tracking feedback and GUI
+  commands. A very congested link can delay control traffic by a frame time.
+  Sends have a 5 s timeout so a dead link cannot hang teardown.
+- **Decode runs on the session network thread.** Roughly 5-8 ms per 720p frame;
+  fine for 2 cameras, likely the first thing to optimise for 3+.
+- **The v4l2 device allocator is per session.** Two headsets connected at once
+  would both try `/dev/video10`. Not an issue for a single-headset setup.
+- **EPOS EXPAND Vision 1 is flaky** in general (it sometimes outputs a static
+  "camera off" image instead of video). It is not the passthrough that breaks.
+- **Reboot automation is manual**: start `wivrn-server`, then launch the app on
+  the headset.
+- The camera resolution is negotiated to the closest size the camera supports; the
+  server asks for 1280x720@30.
+
+---
+
+## Upstream
+
+This fork tracks [WiVRn/WiVRn](https://github.com/WiVRn/WiVRn). Everything that is
+not camera-related is upstream code; see the upstream README history and
+[`docs/`](docs/) for the rest of the documentation (building, configuration,
+debugging, SteamVR, NVENC, profiling, Flatpak).
+
+Licensed under the GNU General Public License v3.0, same as upstream. libusb is
+statically linked into the APK under the LGPL-2.1; its licence text is included in
+the app's licence directory.

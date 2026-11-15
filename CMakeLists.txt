@@ -140,8 +140,11 @@ if (WIVRN_BUILD_SERVER)
         message(FATAL_ERROR "No encoder selected, use at least one of WIVRN_USE_NVENC, WIVRN_USE_VAAPI, WIVRN_USE_VULKAN_ENCODE or WIVRN_USE_X264")
     endif()
 
+    # The camera sink always needs libavcodec (MJPEG decode), independently of
+    # the video encoder.
+    pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
+
     if (WIVRN_USE_VAAPI)
-        pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
         pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
     endif()
 
@@ -255,6 +258,9 @@ FetchContent_Declare(openxr_loader EXCLUDE_FROM_ALL SYSTEM URL https://github.co
                                    URL_HASH SHA256=d45d12d71cbe381a6fc510ec95ec84a88fe30724674e63bb038dfc9a481d8885)
 FetchContent_Declare(spdlog        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/gabime/spdlog/archive/refs/tags/v1.16.0.tar.gz
                                    URL_HASH SHA256=8741753e488a78dd0d0024c980e1fb5b5c85888447e309d9cb9d949bdb52aa3e)
+FetchContent_Declare(libusb        EXCLUDE_FROM_ALL SYSTEM URL https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz
+                                   URL_HASH SHA256=e8f18a7a36ecbb11fb820bd71540350d8f61bcd9db0d2e8c18a6fb80b214a3de
+                                   )
 FetchContent_Declare(stb           EXCLUDE_FROM_ALL SYSTEM URL https://github.com/nothings/stb/archive/013ac3beddff3dbffafd5177e7972067cd2b5083.zip
                                    URL_HASH SHA256=b7f476902bbef1b30f8ecc2d9d95c459c32302c8b559d09b589b5955463b7af8)
 set(KTX_VERSION "4.4.2")
