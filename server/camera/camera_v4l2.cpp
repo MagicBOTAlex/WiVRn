@@ -26,10 +26,13 @@ extern "C"
 }
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -37,10 +40,12 @@ extern "C"
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <poll.h>
 #include <set>
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -117,7 +122,12 @@ public:
 
 	~v4l2_camera()
 	{
+		stop_worker();
 		stop_stream();
+		if (packet)
+			av_packet_free(&packet);
+		if (frame)
+			av_frame_free(&frame);
 		if (fd >= 0)
 			close(fd);
 		if (codec)
@@ -160,9 +170,20 @@ public:
 				U_LOG_E("Failed to open MJPEG decoder");
 				return false;
 			}
+			packet = av_packet_alloc();
+			frame = av_frame_alloc();
+			if (not packet or not frame)
+			{
+				U_LOG_E("Failed to allocate MJPEG decode buffers");
+				return false;
+			}
 		}
 
-		return open_device();
+		if (not open_device())
+			return false;
+
+		start_worker();
+		return true;
 	}
 
 	// Called when the v4l2 node disappeared (module reload, device removed).
@@ -181,28 +202,91 @@ public:
 		return false;
 	}
 
+	// Called from the session thread: only enqueues, never decodes.
 	void process_frame(from_headset::camera_frame && frame)
 	{
-		if (frame.payload.empty())
+		if (frame.payload.empty() or frame.payload.size() > (16u << 20))
 			return;
-		if (frame.payload.size() > (16u << 20))
+
+		{
+			std::lock_guard lock(queue_mutex);
+			if (not worker_running)
+				return;
+			// Drop the oldest frame: a slow consumer must not build a backlog.
+			if (queue.size() >= 2)
+				queue.pop_front();
+			queue.push_back(std::move(frame));
+		}
+		queue_cv.notify_one();
+	}
+
+private:
+	void start_worker()
+	{
+		if (worker_running.exchange(true))
+			return;
+		worker = std::thread([this] { worker_loop(); });
+	}
+
+	void stop_worker()
+	{
+		{
+			std::lock_guard lock(queue_mutex);
+			if (not worker_running.exchange(false))
+				return;
+			queue.clear();
+		}
+		queue_cv.notify_all();
+		if (worker.joinable())
+			worker.join();
+	}
+
+	void worker_loop()
+	{
+		while (true)
+		{
+			from_headset::camera_frame f;
+			{
+				std::unique_lock lock(queue_mutex);
+				queue_cv.wait(lock, [this] { return not worker_running or not queue.empty(); });
+				if (queue.empty())
+				{
+					if (not worker_running)
+						return;
+					continue;
+				}
+				f = std::move(queue.front());
+				queue.pop_front();
+			}
+			decode_and_write(std::move(f));
+		}
+	}
+
+	// True when the v4l2 node has a free buffer, i.e. somebody is consuming.
+	// With no reader this stays false and we skip the JPEG decode entirely.
+	bool can_write() const
+	{
+		if (not streaming or fd < 0)
+			return true; // first frames: decode so configure() can run
+		pollfd p{.fd = fd, .events = POLLOUT, .revents = 0};
+		return poll(&p, 1, 0) > 0 and (p.revents & (POLLOUT | POLLERR));
+	}
+
+	void decode_and_write(from_headset::camera_frame && f)
+	{
+		if (not can_write())
 			return;
 
 		if (dead_flag and not reopen())
 			return;
 
-		AVPacket * packet = av_packet_alloc();
-		if (not packet)
+		av_packet_unref(packet);
+		if (av_new_packet(packet, f.payload.size()) < 0)
 			return;
-		if (av_new_packet(packet, frame.payload.size()) < 0)
-		{
-			av_packet_free(&packet);
-			return;
-		}
-		std::memcpy(packet->data, frame.payload.data(), frame.payload.size());
+		std::memcpy(packet->data, f.payload.data(), f.payload.size());
 
 		const int send_result = avcodec_send_packet(codec, packet);
-		av_packet_free(&packet);
+		av_packet_unref(packet);
 		if (send_result < 0)
 		{
 			if (send_result == AVERROR_INVALIDDATA)
@@ -220,25 +304,17 @@ public:
 		// "output pending" and the next send returns EAGAIN forever.
 		while (true)
 		{
-			AVFrame * decoded = av_frame_alloc();
-			if (not decoded)
-				return;
-
-			const int result = avcodec_receive_frame(codec, decoded);
+			av_frame_unref(frame);
+			const int result = avcodec_receive_frame(codec, frame);
 			if (result == AVERROR(EAGAIN) or result == AVERROR_EOF)
-			{
-				av_frame_free(&decoded);
 				break;
-			}
 			if (result < 0)
 			{
-				av_frame_free(&decoded);
 				avcodec_flush_buffers(codec);
 				break;
 			}
 
-			handle_frame(decoded);
-			av_frame_free(&decoded);
+			handle_frame(frame);
 		}
 	}
 
@@ -587,7 +663,16 @@ private:
 	uint64_t unsupported_format = 0;
 	uint64_t bad_dimensions = 0;
 	AVCodecContext * codec = nullptr;
+	AVPacket * packet = nullptr;
+	AVFrame * frame = nullptr;
 	std::vector<buffer> buffers;
+
+	// Decoding happens on this thread so the session thread only enqueues.
+	std::thread worker;
+	std::atomic<bool> worker_running{false};
+	std::mutex queue_mutex;
+	std::condition_variable queue_cv;
+	std::deque<from_headset::camera_frame> queue;
 };
 
 // Optional per-camera assignment, so a physical camera always lands on the same

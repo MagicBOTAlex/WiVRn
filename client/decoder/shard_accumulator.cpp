@@ -37,6 +37,7 @@ shard_set::shard_set(uint8_t stream_index)
 void shard_set::reset(uint64_t frame_index)
 {
 	min_for_reconstruction = -1;
+	contiguous = 0;
 	data.clear();
 
 	uint8_t stream_index = feedback.stream_index;
@@ -57,10 +58,7 @@ static bool is_complete(const shard_set & shards)
 		return false;
 	if (not(frame.back() and frame.back()->timing_info))
 		return false;
-	for (const auto & shard: frame)
-		if (not shard)
-			return false;
-	return true;
+	return shards.contiguous == frame.size();
 }
 
 std::optional<uint16_t> shard_set::insert(data_shard && shard, xr::instance & instance)
@@ -74,6 +72,12 @@ std::optional<uint16_t> shard_set::insert(data_shard && shard, xr::instance & in
 	if (data[idx])
 		return {};
 	data[idx] = std::move(shard);
+	if (idx == contiguous)
+	{
+		++contiguous;
+		while (contiguous < data.size() and data[contiguous])
+			++contiguous;
+	}
 	return idx;
 }
 
@@ -82,7 +86,7 @@ static void debug_why_not_sent(const shard_set & shards)
 	const auto & frame = shards.data;
 	if (frame.empty())
 	{
-		spdlog::info("frame {} was not sent because no shard was received", shards.frame_index());
+		spdlog::debug("frame {} was not sent because no shard was received", shards.frame_index());
 		return;
 	}
 	int frame_idx = -1;
@@ -100,7 +104,7 @@ static void debug_why_not_sent(const shard_set & shards)
 	}
 
 	bool end = frame.back() and frame.back()->timing_info;
-	spdlog::info("frame {} was not sent with {} data shards, {}{} missing", frame_idx, data, end ? "" : "at least ", missing);
+	spdlog::debug("frame {} was not sent with {} data shards, {}{} missing", frame_idx, data, end ? "" : "at least ", missing);
 }
 
 void shard_accumulator::advance()
@@ -117,7 +121,7 @@ void shard_accumulator::push_shard(video_stream_data_shard && shard)
 	if (shard.frame_idx < current.frame_index())
 	{
 		// frame is in the past, drop it
-		spdlog::info("Drop shard for old frame {} (current {})", shard.frame_idx, current.frame_index());
+		spdlog::debug("Drop shard for old frame {} (current {})", shard.frame_idx, current.frame_index());
 	}
 	else if (frame_diff == 0)
 	{
@@ -169,9 +173,9 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 {
 	auto & data_shards = current.data;
 
-	for (size_t idx = 0; idx < shard_idx; ++idx)
-		if (not data_shards[idx])
-			return;
+	// Everything before `contiguous` is present; anything at or after it has a gap.
+	if (shard_idx >= current.contiguous)
+		return;
 
 	uint16_t last_idx = shard_idx + 1;
 	for (size_t size = data_shards.size();
@@ -180,13 +184,13 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 	{
 	}
 
-	std::vector<std::span<const uint8_t>> payload;
-	payload.reserve(last_idx - shard_idx);
+	payload_buffer.clear();
+	payload_buffer.reserve(last_idx - shard_idx);
 	for (size_t idx = shard_idx; idx < last_idx; ++idx)
-		payload.emplace_back(data_shards[idx]->payload);
+		payload_buffer.emplace_back(data_shards[idx]->payload);
 
 	bool frame_complete = last_idx == data_shards.size() and data_shards.back()->timing_info;
-	decoder_->push_data(payload, data_shards[shard_idx]->frame_idx, not frame_complete);
+	decoder_->push_data(payload_buffer, data_shards[shard_idx]->frame_idx, not frame_complete);
 
 	if (not frame_complete)
 		return;

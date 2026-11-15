@@ -75,7 +75,8 @@ void scenes::stream::operator()(to_headset::server_message && message)
 
 void scenes::stream::operator()(to_headset::video_stream_data_shard && shard)
 {
-	std::shared_lock lock(decoder_mutex);
+	// No decoder_mutex here: setup() and this handler both run on the network
+	// thread, and the render thread only reads the decoders under the lock.
 	uint8_t idx = shard.stream_item_idx;
 	if (idx >= decoders.size())
 	{

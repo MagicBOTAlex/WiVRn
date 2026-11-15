@@ -49,6 +49,9 @@ public:
 	struct shard_set
 	{
 		size_t min_for_reconstruction = -1;
+		// Number of consecutive shards present from index 0, maintained by insert()
+		// so the completeness check is O(1) instead of O(n^2).
+		size_t contiguous = 0;
 		std::vector<std::optional<data_shard>> data;
 		void reset(uint64_t frame_index);
 		bool empty() const;
@@ -72,6 +75,8 @@ public:
 private:
 	shard_set current;
 	shard_set next;
+	// Reused across shards: this used to be a fresh vector per shard.
+	std::vector<std::span<const uint8_t>> payload_buffer;
 	std::weak_ptr<scenes::stream> weak_scene;
 	xr::instance & instance;
 

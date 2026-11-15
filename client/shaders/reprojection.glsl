@@ -55,9 +55,9 @@ layout(location = 0) out vec4 outColor;
 
 float sRGB_to_linear(float x)
 {
-	if (x <= 0.04045)
-		return x / 12.92;
-	return pow((x + 0.055) / 1.055, 2.4);
+	// Polynomial approximation of the sRGB EOTF (max error < 0.5/255). Three
+	// pow() per pixel over a full eye is measurable on a mobile GPU.
+	return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878);
 }
 
 vec4 sRGB_to_linear_rgba(vec4 x)

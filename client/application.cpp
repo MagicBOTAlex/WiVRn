@@ -36,6 +36,9 @@
 #include "xr/htc_face_tracker.h"
 #include "xr/to_string.h"
 #include <algorithm>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #include <boost/locale.hpp>
 #include <boost/url/parse.hpp>
 #include <chrono>
@@ -1802,6 +1805,11 @@ application::~application()
 
 void application::loop()
 {
+#ifdef __ANDROID__
+	// The render thread must not be preempted by decode, network or camera
+	// threads. -4 is THREAD_PRIORITY_DISPLAY, which apps may set.
+	setpriority(PRIO_PROCESS, 0, -4);
+#endif
 	poll_events();
 	battery_monitor->poll_batteries();
 
@@ -1823,7 +1831,6 @@ void application::loop()
 
 		if (scene)
 		{
-			poll_actions();
 			if (auto tmp = last_scene.lock(); scene != tmp)
 			{
 				if (tmp)
@@ -1834,6 +1841,10 @@ void application::loop()
 			scene->set_focused(true);
 
 			XrFrameState framestate = xr_session.wait_frame();
+
+			// Sync actions after wait_frame: reading them before means every input
+			// is one whole frame stale (OpenXR best practice).
+			poll_actions();
 
 			auto t1 = std::chrono::steady_clock::now();
 

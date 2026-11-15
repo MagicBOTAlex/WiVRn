@@ -85,6 +85,22 @@ public:
 		return {};
 	}
 
+	// Non-blocking: returns nullopt instead of waiting for an item.
+	std::optional<T> try_pop()
+	{
+		std::lock_guard lock(mutex);
+
+		if (closed)
+			throw sync_queue_closed{};
+
+		if (queue.empty())
+			return std::nullopt;
+
+		T item = std::move(queue.front());
+		queue.pop_front();
+		return item;
+	}
+
 	T pop()
 	{
 		std::unique_lock lock(mutex);

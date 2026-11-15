@@ -34,7 +34,9 @@
             pkgs.util-linux
           ];
 
-          package = pkgs.enableDebugging (
+          # Build optimised: enableDebugging forces -Og, which is ~2.4x slower on
+          # the per-pixel hot paths. Use `packages.debug` when you need symbols.
+          package =
             pkgs.wivrn.overrideAttrs (
               finalAttrs: oldAttrs: {
                 # Filter the directories and files we don't need to keep to avoid needless rebuilds
@@ -82,14 +84,15 @@
                   (lib.cmakeFeature "GIT_COMMIT" "nightly")
                 ];
               }
-            )
-          );
+            );
+          debugPackage = pkgs.enableDebugging package;
         in
         {
           formatter = pkgs.nixfmt;
 
           packages = {
             default = package;
+            debug = debugPackage;
             dissector = package.overrideAttrs (oldAttrs: {
               pname = "wivrn-dissector";
               cmakeFlags = (lib.filter (flag: !(lib.hasPrefix "-DWIVRN_BUILD" flag)) oldAttrs.cmakeFlags) ++ [

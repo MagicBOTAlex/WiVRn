@@ -136,12 +136,15 @@ decoder::decoder(
 	{
 		AMediaFormat_ptr format(AMediaFormat_new());
 		AMediaFormat_setString(format.get(), AMEDIAFORMAT_KEY_MIME, mime(description.codec[stream_index]));
-		// AMediaFormat_setInt32(format.get(), "vendor.qti-ext-dec-low-latency.enable", 1); // Qualcomm low
-		// latency mode
 		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_WIDTH, width);
 		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_HEIGHT, height);
 		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_OPERATING_RATE, std::ceil(description.frame_rate));
 		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_PRIORITY, 0);
+		// Low-latency mode: the default decoder keeps extra internal buffering and
+		// sometimes a reorder pipeline, which costs about a frame.
+		AMediaFormat_setInt32(format.get(), "low-latency", 1);
+		AMediaFormat_setInt32(format.get(), "vendor.qti-ext-dec-low-latency.enable", 1);
+		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, width * height * 3 / 2);
 
 		media_codec.reset(AMediaCodec_createDecoderByType(mime(description.codec[stream_index])));
 
@@ -216,7 +219,13 @@ decoder::~decoder()
 void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
 	if (current_input_buffer.data == nullptr)
-		current_input_buffer = input_buffers.pop();
+	{
+		// Never block the receive thread on the decoder: drop the frame instead.
+		auto buffer = input_buffers.try_pop();
+		if (not buffer)
+			return;
+		current_input_buffer = std::move(*buffer);
+	}
 	else if (current_input_buffer.frame_index != frame_index)
 	{
 		// Reuse the input buffer, discard existing data
@@ -237,18 +246,48 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 	}
 
 	if (partial)
+	{
+		// Hand the decoder what has arrived so far: waiting for the whole frame
+		// adds the entire transmission time (several ms) to the latency.
+		if (partial_frames and current_input_buffer.data_size >= 32 * 1024)
+			queue_current(AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME);
+		return;
+	}
+
+	queue_current(0);
+}
+
+void decoder::queue_current(uint32_t flags)
+{
+	input_buffer buf = current_input_buffer;
+	current_input_buffer = input_buffer{};
+	if (buf.data == nullptr)
 		return;
 
-	jobs.push([=, idx = current_input_buffer.idx, data_size = current_input_buffer.data_size, mc = media_codec.get()]() {
-		uint64_t timestamp = frame_index * 10'000;
-		auto status = AMediaCodec_queueInputBuffer(mc, idx, 0, data_size, timestamp, 0);
+	jobs.push([this, buf, mc = media_codec.get(), flags]() mutable {
+		uint64_t timestamp = buf.frame_index * 10'000;
+		auto status = AMediaCodec_queueInputBuffer(mc, buf.idx, 0, buf.data_size, timestamp, flags);
 		if (status != AMEDIA_OK)
-			spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
-			              int(status),
-			              std::string(magic_enum::enum_name(status)).c_str());
+		{
+			if (flags & AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME)
+			{
+				// The codec does not support partial frames: stop using them and
+				// drop this frame (the next one is queued whole).
+				partial_frames = false;
+				spdlog::warn("MediaCodec rejected a partial frame, falling back to whole-frame input");
+			}
+			else
+			{
+				spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
+				              int(status),
+				              std::string(magic_enum::enum_name(status)).c_str());
+			}
+			buf.data_size = 0;
+			buf.frame_index = 0;
+			input_buffers.push(std::move(buf));
+		}
 		return false;
 	});
-	current_input_buffer = input_buffer{};
 }
 
 void decoder::frame_completed(const wivrn::from_headset::feedback & feedback, const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info)

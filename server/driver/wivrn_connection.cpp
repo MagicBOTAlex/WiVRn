@@ -262,7 +262,11 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 	{
 		client_address.sin6_port = htons(client_port);
 		stream.connect(client_address);
-		stream.set_send_buffer_size(1024 * 1024 * 5);
+		// Enough for a burst, small enough that a congested link drops frames
+		// instead of queueing hundreds of milliseconds of stale video.
+		stream.set_send_buffer_size(512 * 1024);
+		// DSCP EF: let Wi-Fi WMM put video in the voice/video access category.
+		stream.set_tos(0xB8);
 	}
 	else
 	{

@@ -130,6 +130,8 @@ android {
                           '-DANDROID_STL=' + stl,
                           '-DCMAKE_ANDROID_NDK_VERSION=' + ndkVersion,
                           '-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON',
+                          '-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O3 -g -DNDEBUG',
+                          '-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O3 -g -DNDEBUG',
                           '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
                           '-DCMAKE_ANDROID_ASSETS_DIRECTORIES=' + layout.buildDirectory.dir("assets").get().asFile,
                           '-DRESOURCES_DIRECTORIES=' + layout.buildDirectory.dir("resources").get().asFile,

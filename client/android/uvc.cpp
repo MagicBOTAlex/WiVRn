@@ -321,6 +321,7 @@ struct capture::impl
 	std::deque<queued_frame> queue;
 	std::thread delivery_thread;
 	std::atomic<bool> delivery_running{false};
+	uint64_t delivered = 0;
 
 	std::vector<libusb_transfer *> transfers;
 	std::vector<uint8_t *> transfer_buffers;
@@ -465,6 +466,12 @@ struct capture::impl
 				f = std::move(queue.front());
 				queue.pop_front();
 			}
+
+			if (++delivered % 300 == 0)
+				spdlog::debug("UVC: {} frames received, {} dropped, last {} bytes",
+				              frames_received,
+				              frames_dropped,
+				              f.data.size());
 
 			if (not cb)
 				continue;
@@ -825,6 +832,11 @@ std::unique_ptr<capture> capture::start(int fd, int width, int height, int fps, 
 	if (chosen_interval == 0)
 		chosen_interval = target_interval;
 	impl_ptr->interval = chosen_interval;
+
+	spdlog::info("UVC: endpoint packet {} bytes, {} transfers of {} bytes",
+	             best.max_packet_size,
+	             VS_NUM_TRANSFERS,
+	             best.is_iso ? best.max_packet_size * VS_PACKETS_PER_TRANSFER : VS_BULK_TRANSFER_SIZE);
 
 	spdlog::info("UVC: interface {} alt {} ep 0x{:02x} {} format {} (MJPEG), frame {} {}x{} @ {:.2f} fps",
 	             best.interface_number,
