@@ -521,7 +521,7 @@ symptom.
   and discarded as "old";
 - the IDR handler retried on the very next frame, so it never recovered.
 
-Fixed in `7d6a1f4`:
+Fixed in `1d4580e8`:
 
 - `sync_queue::pop_for()` and a 20 ms wait in `push_data`: a saturated decoder
   now applies backpressure to the receive thread instead of dropping frames.
