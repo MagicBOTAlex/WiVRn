@@ -316,6 +316,11 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 	for (size_t view = 0; view < view_count; ++view)
 	{
 		const auto out_size = defoveated_size(foveation[view]);
+		// The mesh is built in the foveated size (the server's render extent),
+		// which can be larger than the swapchain. Scale it to the output.
+		const glm::vec2 mesh_scale(
+		        float(output_extent.width) / float(out_size.width),
+		        float(output_extent.height) / float(out_size.height));
 		auto vertices = get_vertices(view);
 		const auto & [px, py] = foveation[view];
 		assert(px.size() % 2 == 1);
@@ -323,26 +328,22 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 		const int n_ratio_y = (py.size() - 1) / 2;
 		const int n_ratio_x = (px.size() - 1) / 2;
 
-		command_buffer.setScissor(
-		        0,
-		        vk::Rect2D{
-		                .extent = {.width = uint32_t(out_size.width), .height = uint32_t(out_size.height)},
-		        });
+		command_buffer.setScissor(0, vk::Rect2D{.extent = output_extent});
 		command_buffer.setViewport(
 		        0,
 		        vk::Viewport{
 		                .x = 0,
 		                .y = 0,
-		                .width = float(out_size.width),
-		                .height = float(out_size.height),
+		                .width = float(output_extent.width),
+		                .height = float(output_extent.height),
 		                .minDepth = 0,
 		                .maxDepth = 1,
 		        });
 
 		glm::uvec2 in(0);
 		glm::vec2 out(-0.5 * out_size.width, -0.5 * out_size.height); // pixel coordinates
-		glm::vec2 out_pixel_size(2. / out_size.width,
-		                         2. / out_size.height);
+		glm::vec2 out_pixel_size(2. / output_extent.width,
+		                         2. / output_extent.height);
 		for (auto [iy, n_out_y]: utils::enumerate_range(py))
 		{
 			// number of output pixels per source pixels
@@ -353,28 +354,28 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 			{
 				const int ratio_x = std::abs(n_ratio_x - int(ix)) + 1;
 				*vertices++ = {
-				        .position = out * out_pixel_size,
+				        .position = (out * mesh_scale) * out_pixel_size,
 				        .uv = in,
 				};
 				*vertices++ = {
-				        .position = (out + glm::vec2(0, n_out_y * ratio_y)) * out_pixel_size,
+				        .position = ((out + glm::vec2(0, n_out_y * ratio_y)) * mesh_scale) * out_pixel_size,
 				        .uv = (in + glm::uvec2(0, n_out_y)),
 				};
 				in.x += n_out_x;
 				out.x += n_out_x * ratio_x;
 			}
 			*vertices++ = {
-			        .position = out * out_pixel_size,
+			        .position = (out * mesh_scale) * out_pixel_size,
 			        .uv = in,
 			};
 			in.y += n_out_y;
 			out.y += n_out_y * ratio_y;
 			*vertices++ = {
-			        .position = out * out_pixel_size,
+			        .position = (out * mesh_scale) * out_pixel_size,
 			        .uv = in,
 			};
 			*vertices++ = {
-			        .position = out * out_pixel_size,
+			        .position = (out * mesh_scale) * out_pixel_size,
 			        .uv = in,
 			};
 		}

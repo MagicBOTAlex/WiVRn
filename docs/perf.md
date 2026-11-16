@@ -73,6 +73,8 @@ A does 30 fps on the same bus.
 | UDP send buffer 5 MB → 512 KB, DSCP EF | bounded queueing delay under congestion; Wi-Fi WMM video AC |
 | Render thread priority -4 (Android) | keep the render thread ahead of decode/network/camera threads |
 | Loss-path logs demoted to debug | the packet-loss path logged several lines per frame on the network thread |
+| Encoder: 3 slots, drop instead of `wait_idle` | the app thread waited for the previous frame's socket writes; now a busy sender drops a frame instead of stalling |
+| Client blit target capped at the panel size | the foveation mesh was rendered at `resolution_scale` (1.2x) the panel; the extra detail is discarded by the display |
 
 ## Results after
 
@@ -85,13 +87,20 @@ Same workload (`wayvr` streaming, 2 cameras, 20 s runs):
 | Dropped frames | 0 | 0 |
 | Server CPU (streaming) | 13.2 % (-Og) | 13.0 % (-O3) |
 | Headset CPU (streaming) | ~104 % | ~104 % |
-| Motion to photons | ~70 ms | 67-74 ms |
+| Motion to photons | ~70 ms | 56-58 ms |
+| Client blit target | 2476x2594 | 2064x2162 (panel) |
+| CPU time / frame (overlay) | 10-18 ms | 8-13 ms |
 
-The CPU counters did not move much: the stream is GPU/NVENC-bound and the
-remaining CPU is spread across decode and compositing. The wins on this branch are
-latency and jitter (input, decode start, session-thread stalls), which these
-counters do not show. Measuring them needs the feedback timestamps
-(`encode_begin` … `displayed`) or a high-speed camera on the panel.
+The server/headset CPU counters did not move much: the stream is GPU/NVENC-bound
+and the remaining CPU is spread across decode and compositing. The wins on this
+branch are latency and jitter (input, decode start, session-thread stalls, encode
+stalls) and GPU fill (blit target). Measuring them needs the feedback timestamps
+(`encode_begin` … `displayed`), the in-headset statistics overlay, or a
+high-speed camera on the panel.
+
+Note that the headset CPU% varies by 30-50% between runs with the same scene
+(thermal state, Wi-Fi retries, how much of wayvr is on screen); compare CPU time
+per frame from the overlay rather than the process-wide percentage.
 
 ## Where the remaining time goes
 
@@ -100,14 +109,11 @@ From the reviews (ranked by expected gain):
 1. **Server `layer_commit` waits for the GPU every frame** (`compositor.cpp`) to
    read timestamp queries that only feed debug graphs. Removing it needs
    double-buffered command buffers/descriptor sets/squash target; worth ~1-2 ms
-   and real CPU/GPU overlap.
-2. **Encoder and sender are serialised** (`video_encoder::sender::wait_idle`,
-   one bitstream buffer, synchronous NVENC). Per-slot bitstream buffers and
-   non-blocking `present_image` would remove 1-3 ms under load.
-3. **The client blit target is 1.2x the panel** (`resolution_scale`). The extra
-   detail is discarded by the panel; capping the client swapchain at 1.0 would cut
-   ~30 % of the defoveate fill (2-7 ms GPU).
-4. **Camera frames share the TCP control socket** with feedback. A camera frame
+   and real CPU/GPU overlap. This is the largest remaining latency item.
+2. **Per-slot NVENC bitstream buffers**: the encoder still has one bitstream
+   buffer, so a busy sender drops a frame (done) rather than encoding ahead.
+   Encoding one frame ahead would remove the drop and smooth bursts.
+3. **Camera frames share the TCP control socket** with feedback. A camera frame
    can delay feedback and, on a stalled socket, the session. Moving camera frames
    to the UDP stream path (they are all keyframes) removes that coupling.
 5. **Adaptive bitrate**: `feedback` has no loss/queue signal, so the bitrate is a

@@ -88,6 +88,12 @@ void video_encoder::sender::wait_idle(video_encoder * encoder)
 		cv.wait_for(lock, std::chrono::milliseconds(100));
 }
 
+bool video_encoder::sender::has_pending(video_encoder * encoder)
+{
+	std::unique_lock lock(mutex);
+	return std::ranges::any_of(pending, [=](auto & data) { return data.encoder == encoder; });
+}
+
 std::shared_ptr<video_encoder::sender> video_encoder::sender::get()
 {
 	static std::weak_ptr<video_encoder::sender> instance;
@@ -268,8 +274,12 @@ void video_encoder::encode(wivrn_session & cnx,
 	if (state[encode_slot] == skip)
 		return;
 
-	if (shared_sender)
-		shared_sender->wait_idle(this);
+	// If the sender is still busy with the previous frame, drop this one instead
+	// of stalling the app thread (which waits on this slot in present_image).
+	// The single bitstream buffer is still locked by the pending data, so we
+	// cannot encode into it yet.
+	if (shared_sender and shared_sender->has_pending(this))
+		return;
 	this->cnx = &cnx;
 	clock = cnx.get_offset();
 
