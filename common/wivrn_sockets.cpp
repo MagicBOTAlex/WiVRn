@@ -177,6 +177,18 @@ void wivrn::TCP::init()
 	timeval send_timeout{.tv_sec = 5, .tv_usec = 0};
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 
+	// Detect a silently dead link instead of waiting for a send to time out.
+	// Without this an idle session can look alive indefinitely after a Wi-Fi
+	// drop, so neither side ever reconnects.
+	int keepalive = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+	int keepidle = 10;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+	int keepintvl = 5;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+	int keepcnt = 3;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
 	mutex = std::make_unique<std::mutex>();
 }
 
@@ -417,7 +429,6 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 
 	iv_counters.reserve(packets.size());
 
-	size_t sent = 0;
 	for (serialization_packet & packet: packets)
 	{
 		std::vector<std::span<uint8_t>> & data = packet;
@@ -437,10 +448,7 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 		}
 
 		for (const auto & span: data)
-		{
 			iovecs.emplace_back(span.data(), span.size_bytes());
-			sent += span.size();
-		}
 
 		if (encrypted)
 			mmsgs.push_back({.msg_hdr = {.msg_iovlen = data.size() + 1}});
@@ -454,10 +462,16 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 		j += mmsgs[i].msg_hdr.msg_iovlen;
 	}
 
-	// sendmmsg may not send all messages, just consider them as lost for UDP
-	if (sendmmsg(fd, mmsgs.data(), mmsgs.size(), 0) < 0)
+	// sendmmsg may send fewer messages than asked; for UDP the rest are lost.
+	// Treat a congested socket the same way as send_raw: return 0, do not throw.
+	int queued = sendmmsg(fd, mmsgs.data(), mmsgs.size(), 0);
+	if (queued < 0)
+	{
+		if (errno == EAGAIN or errno == EWOULDBLOCK or errno == ENOBUFS)
+			return 0;
 		throw std::system_error{errno, std::generic_category()};
-	return sent;
+	}
+	return queued;
 }
 
 wivrn::deserialization_packet wivrn::TCP::receive_raw()

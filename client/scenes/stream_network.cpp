@@ -245,7 +245,10 @@ void scenes::stream::start_camera_sender()
 			// Camera frames are droppable; the control socket is not. If the link
 			// is backed up, drop the frame rather than queue behind feedback and
 			// video keyframes (and risk a send timeout, which corrupts framing).
-			constexpr size_t max_control_backlog = 512 * 1024;
+			// ~2 frame times at the measured camera rate, i.e. a latency budget
+			// rather than a buffer budget: 512 KB allowed ~140 ms of camera bytes
+			// in front of feedback and video keyframes.
+			constexpr size_t max_control_backlog = 96 * 1024;
 			if (network_session->control_send_queue_bytes() > max_control_backlog)
 			{
 				if (dropped++ % 30 == 0)

@@ -617,7 +617,10 @@ static xrt_device_name get_name(interaction_profile profile)
 		case interaction_profile::valve_frame_controller_valve:
 			return XRT_DEVICE_FRAME_CONTROLLER;
 	}
-	throw std::runtime_error("invalid interaction profile id " + std::to_string(int(profile)));
+	// An unknown profile is a protocol skew or a corrupted packet, not a reason to
+	// drop the headset: treating it as a network error paused the whole session.
+	U_LOG_W("ignoring unknown interaction profile id %d", int(profile));
+	return XRT_DEVICE_INVALID;
 }
 
 void wivrn_session::operator()(const from_headset::tracking & tracking)
@@ -742,20 +745,23 @@ void wivrn_session::operator()(from_headset::hand_tracking && hand_tracking)
 
 void wivrn_session::operator()(from_headset::meta_body && body_tracking)
 {
-	assert(body_tracker);
+	if (not body_tracker)
+		return; // tracking is disabled: drop the packet instead of dereferencing null
 
 	auto offset = offset_est.get_offset();
 	body_tracker->update_tracking(body_tracking, offset);
 }
 void wivrn_session::operator()(from_headset::meta_body_skeleton && body_skeleton)
 {
-	assert(body_tracker);
+	if (not body_tracker)
+		return;
 
 	body_tracker->update_skeleton(body_skeleton);
 }
 void wivrn_session::operator()(from_headset::bd_body && body_tracking)
 {
-	assert(body_tracker);
+	if (not body_tracker)
+		return;
 
 	auto offset = offset_est.get_offset();
 	body_tracker->update_tracking(body_tracking, offset);
@@ -1334,7 +1340,14 @@ struct refresh_rate_adjuster
 
 void wivrn_session::run_net(std::stop_token stop)
 {
-	resume_session();
+	try
+	{
+		resume_session();
+	}
+	catch (const std::exception & e)
+	{
+		U_LOG_E("Exception on initial session resume: %s", e.what());
+	}
 	while (not stop.stop_requested())
 	{
 		try
@@ -1357,7 +1370,17 @@ void wivrn_session::run_net(std::stop_token stop)
 		catch (const std::exception & e)
 		{
 			U_LOG_W("Network exception: %s, Session paused.", e.what());
-			pause_session();
+			try
+			{
+				pause_session();
+			}
+			catch (const std::exception & e2)
+			{
+				// A secondary failure while handling a network error must not
+				// escape the thread (that is std::terminate, i.e. the server dies
+				// during its own error recovery).
+				U_LOG_E("Exception while pausing the session: %s", e2.what());
+			}
 
 			reconnect(stop);
 			if (stop.stop_requested())
