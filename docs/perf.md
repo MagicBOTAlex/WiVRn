@@ -3,6 +3,9 @@
 Scope: the PC-side stream (NVENC encode → send) and the client decode/present
 path. Camera passthrough is out of scope.
 
+> **Continuing this work?** See [`perf-handoff.md`](perf-handoff.md) for the
+> prioritised plan, file map, build commands and known traps.
+
 ## Where the 50 ms actually goes
 
 `WIVRN_PIPELINE_STATS=1 wivrn-server` prints a per-stream breakdown averaged over
