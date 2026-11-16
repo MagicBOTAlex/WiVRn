@@ -84,10 +84,16 @@
                 # supported" for every codec.
                 nativeBuildInputs = oldAttrs.nativeBuildInputs ++ extraNativeBuildInputs;
 
-                # The addDriverRunpath hook does not touch this binary (its rpath
-                # ends up glibc-only), so add the driver directory explicitly.
+                # The addDriverRunpath hook does not touch these binaries (their
+                # rpath ends up with no driver directory), and NVENC dlopen()s
+                # libcuda/libnvidia-encode at runtime. Patch the real binaries and
+                # the monado libraries, not the small launcher.
                 postFixup = (oldAttrs.postFixup or "") + ''
-                  patchelf --add-rpath /run/opengl-driver/lib $out/bin/wivrn-server
+                  for f in $out/bin/.wivrn-server-wrapped $out/bin/.wivrn-dashboard-wrapped $out/lib/wivrn/*.so*; do
+                    if [ -f "$f" ]; then
+                      patchelf --add-rpath /run/opengl-driver/lib "$f" || true
+                    fi
+                  done
                 '';
                 cmakeFlags = (lib.filter (flag: !lib.hasInfix "GIT_" flag) oldAttrs.cmakeFlags) ++ [
                   (lib.cmakeFeature "GIT_DESC" "nightly")
