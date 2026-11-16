@@ -982,7 +982,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// A single late frame is a backlog, not a dead stream: popping the scene
 		// here kicks the user back to the app list while the app is still
 		// running, and there is no way back into the stream until it restarts.
-		if (blit_handle->feedback.blitted - blit_handle->feedback.received_from_decoder > 3'000'000'000)
+		// Only give up on a stream that has been dead for a long time: a loading
+		// screen or a hiccup must not eject the user to the app list.
+		if (blit_handle->feedback.blitted - blit_handle->feedback.received_from_decoder > 30'000'000'000)
 			set_state(state::stalled);
 		++blit_handle->feedback.times_displayed;
 		blit_handle->feedback.displayed = frame_state.predictedDisplayTime;

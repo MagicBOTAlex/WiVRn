@@ -331,9 +331,12 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 
 	auto begin = data.begin();
 	auto end = data.end();
+	// Only the first shard carries view_info; recomputing its serialized size for
+	// every shard is a full field walk 25 times a frame.
+	size_t view_info_size = serialized_size(shard.view_info);
 	while (begin != end)
 	{
-		const size_t payload_size = std::max(0z, max_payload_size - ssize_t(serialized_size(shard.view_info)));
+		const size_t payload_size = std::max(0z, max_payload_size - ssize_t(view_info_size));
 		auto next = std::min(end, begin + payload_size);
 		if (next == end)
 		{
@@ -350,8 +353,16 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 		{
 			if (control)
 				cnx->send_control(to_headset::video_stream_data_shard{shard});
-			else
-				cnx->send_stream(to_headset::video_stream_data_shard{shard});
+			else if (cnx->send_stream(to_headset::video_stream_data_shard{shard}) == 0)
+			{
+				// The socket dropped this datagram (congested link). The frame can
+				// never be completed, so stop wasting airtime on the rest of it and
+				// ask for a keyframe now instead of waiting for the client to tell
+				// us what we already know.
+				if (auto * h = dynamic_cast<default_idr_handler *>(idr.get()))
+					h->on_local_drop(shard.frame_idx, stream_idx);
+				return;
+			}
 		}
 		catch (...)
 		{
@@ -359,6 +370,7 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 		}
 		++shard.shard_idx;
 		shard.view_info.reset();
+		view_info_size = 1; // empty optional
 		begin = next;
 	}
 	if (end_of_frame)

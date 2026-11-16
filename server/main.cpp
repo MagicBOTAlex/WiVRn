@@ -51,6 +51,7 @@
 #include <avahi-glib/glib-watch.h>
 #include <chrono> // IWYU pragma: keep
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <libnotify/notification.h>
@@ -58,6 +59,7 @@
 #include <memory>
 #include <poll.h>
 #include <random>
+#include <sys/file.h>
 #include <sys/signalfd.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -310,9 +312,6 @@ void start_server(configuration config)
 
 			update_fsm(); }, nullptr);
 	}
-
-	if (do_active_runtime)
-		runtime_setter.emplace();
 }
 
 void kill_server()
@@ -409,8 +408,6 @@ void update_fsm()
 
 		if (not server_running)
 		{
-			runtime_setter.reset();
-
 			g_timeout_add(delay_next_try.count(), [](void *) {
 				start_listening();
 				start_publishing();
@@ -952,9 +949,36 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 
 	std::filesystem::create_directories(socket_path().parent_path());
 
+	// Exactly one server may own the IPC socket. Without this, a second instance
+	// unlinks the first one's socket path and binds a new inode: the first server
+	// keeps listening on the orphaned inode, and every local OpenXR app then
+	// fails with XR_ERROR_RUNTIME_UNAVAILABLE.
+	{
+		auto lock_path = socket_path().parent_path() / "wivrn-server.lock";
+		int lock_fd = open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+		if (lock_fd >= 0)
+		{
+			if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0)
+			{
+				std::cerr << "WiVRn server is already running (lock " << lock_path << ")" << std::endl;
+				close(lock_fd);
+				return wivrn_exit_code::already_running;
+			}
+			// The lock lives as long as this process (and its forked child).
+			// Intentionally never closed.
+			dprintf(lock_fd, "%d\n", int(getpid()));
+		}
+	}
+
 	if (do_active_runtime)
 		active_runtime::cleanup_openxr();
 	listen_socket = create_listen_socket();
+
+	// Register the runtime for the whole server lifetime. It used to be created
+	// only once a headset had connected, so a game started before that found no
+	// runtime and silently ran in desktop mode.
+	if (do_active_runtime)
+		runtime_setter.emplace();
 
 	// Initialize main loop
 	main_loop = g_main_loop_new(nullptr, false);

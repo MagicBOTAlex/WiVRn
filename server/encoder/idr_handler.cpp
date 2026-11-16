@@ -102,6 +102,16 @@ bool default_idr_handler::should_skip(uint64_t frame_id, uint8_t stream_idx)
 	return res;
 }
 
+void default_idr_handler::on_local_drop(uint64_t frame_index, uint8_t stream_idx)
+{
+	std::unique_lock lock(mutex);
+	if (frame_index < next_idr_allowed)
+		return;
+	U_LOG_W("local drop on stream %d (frame %ld), requesting keyframe", stream_idx, long(frame_index));
+	next_idr_allowed = frame_index + 30;
+	state = need_idr{};
+}
+
 void default_idr_handler::set_non_ref(uint64_t frame_index)
 {
 	std::unique_lock lock(mutex);

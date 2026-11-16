@@ -29,5 +29,6 @@ enum
 	cannot_create_pipe,
 	cannot_create_socketpair,
 	cannot_connect_to_avahi,
+	already_running,
 };
 }

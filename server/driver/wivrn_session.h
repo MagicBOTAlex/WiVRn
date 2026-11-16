@@ -208,11 +208,11 @@ public:
 		return connection->has_stream();
 	}
 	template <typename T>
-	void send_stream(T && packet)
+	size_t send_stream(T && packet)
 	{
 		try
 		{
-			connection->send_stream(std::forward<T>(packet));
+			return connection->send_stream(std::forward<T>(packet));
 		}
 		catch (std::exception & e)
 		{

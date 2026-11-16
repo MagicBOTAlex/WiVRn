@@ -71,6 +71,9 @@ public:
 	void reset() override;
 	bool should_skip(uint64_t frame_id, uint8_t stream_idx) override;
 	void set_non_ref(uint64_t frame_index);
+	// The transport dropped a datagram of this frame: it cannot be decoded, so
+	// request a keyframe without waiting for the client's feedback.
+	void on_local_drop(uint64_t frame_index, uint8_t stream_idx);
 	bool is_non_ref_frame(uint64_t frame_index);
 	frame_type get_type(uint64_t frame_index, uint8_t stream_idx);
 };

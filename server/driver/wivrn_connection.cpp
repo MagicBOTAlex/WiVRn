@@ -266,7 +266,9 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 		// stalling the encoder. Keep it small (~20 ms at 50 Mbit/s): a large
 		// buffer would only queue stale video and inflate the latency of every
 		// frame that follows a network hiccup.
-		stream.set_send_buffer_size(64 * 1024);
+		// ~40 ms at 50 Mbit/s. 64 KB only held about one stereo frame-pair, so a
+		// single short stall overflowed it and lost whole frames.
+		stream.set_send_buffer_size(192 * 1024);
 		// DSCP EF: let Wi-Fi WMM put video in the voice/video access category.
 		stream.set_tos(0xB8);
 	}

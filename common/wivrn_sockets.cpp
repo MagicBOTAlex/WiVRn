@@ -582,7 +582,17 @@ size_t wivrn::TCP::send_raw(serialization_packet && packet)
 			throw socket_shutdown{};
 
 		if (sent < 0)
+		{
+			// A partial packet was already written, so the peer's length-prefix
+			// framing (and the CTR keystream) is now desynchronised. Retrying or
+			// continuing is worse than failing: the session must be torn down.
+			if (total_sent > 0)
+			{
+				errno = EPROTO;
+				throw std::system_error{errno, std::generic_category(), "partial write, connection poisoned"};
+			}
 			throw std::system_error{errno, std::generic_category()};
+		}
 
 		total_sent += sent;
 

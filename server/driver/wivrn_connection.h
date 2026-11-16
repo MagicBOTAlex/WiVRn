@@ -91,18 +91,18 @@ public:
 		}
 	}
 
+	// Returns the number of bytes written; 0 means the datagram was dropped
+	// (congested link) and the frame it belongs to can never be completed.
 	template <typename T>
-	void send_stream(T && packet)
+	size_t send_stream(T && packet)
 	{
 		try
 		{
-			if (active)
-			{
-				if (stream)
-					stream.send(std::forward<T>(packet));
-				else
-					control.send(std::forward<T>(packet));
-			}
+			if (not active)
+				return 0;
+			if (stream)
+				return stream.send(std::forward<T>(packet));
+			return control.send(std::forward<T>(packet));
 		}
 		catch (...)
 		{
