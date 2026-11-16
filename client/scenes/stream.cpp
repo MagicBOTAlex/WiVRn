@@ -923,7 +923,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		        size_gpu_timestamps,
 		        size_gpu_timestamps * sizeof(uint64_t),
 		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		        // No eWait: the fence waited on above covers the same command
+		        // buffer, so the results are already available.
+		        vk::QueryResultFlagBits::e64);
 
 		if (res == vk::Result::eSuccess)
 		{
@@ -1266,38 +1268,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	// Network operations may be blocking, do them once everything was submitted
 	{
-		// Keep a copy of the feedback packets as they can be modified if they're encrypted
-		inplace_vector<from_headset::feedback, decoder_count> feedbacks;
-		// +1 for optional foveation packet
-		inplace_vector<serialization_packet, decoder_count + 1> packets;
-
-		feedbacks.reserve(current_blit_handles.size());
-		packets.reserve(current_blit_handles.size());
-
+		// Queue the typed packets: the session's control writer serialises and
+		// sends them from its own thread, so a congested control socket can no
+		// longer block this one. Feedback is coalesced per stream there.
+		bool queued = false;
 		for (const auto & handle: current_blit_handles)
 		{
 			if (handle)
 			{
-				auto & packet = packets.emplace_back();
-				wivrn_session::control_socket_t::serialize(packet, feedbacks.emplace_back(handle->feedback));
+				network_session->send_control(from_headset::feedback{handle->feedback});
+				queued = true;
 			}
 		}
 		if (auto foveation_packet = foveation_center.take_packet())
 		{
-			auto & packet = packets.emplace_back();
-			wivrn_session::control_socket_t::serialize(packet, *foveation_packet);
+			network_session->send_control(std::move(*foveation_packet));
+			queued = true;
 		}
-		if (not packets.empty())
-		{
-			try
-			{
-				network_session->send_control(std::span(packets));
-			}
-			catch (std::exception & e)
-			{
-				spdlog::warn("Exception while sending feedback packet: {}", e.what());
-			}
-		}
+		(void)queued; // the send is asynchronous now
 	}
 
 	auto show_gamepad_toast = [this, now](bool enabled) {

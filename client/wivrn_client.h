@@ -21,9 +21,15 @@
 
 #include "crypto.h"
 #include "wivrn_packets.h"
+
 #include "wivrn_sockets.h"
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <poll.h>
+#include <thread>
+#include <type_traits>
 
 using namespace wivrn;
 
@@ -49,6 +55,88 @@ private:
 	std::atomic<uint64_t> bytes_sent_ = 0;
 	std::atomic<uint64_t> bytes_received_ = 0;
 
+	// Control traffic is written by a dedicated thread. The TCP socket is
+	// blocking (5 s SO_SNDTIMEO) and its mutex is shared by the render, image
+	// reader, tracking and camera threads; sending directly from those threads
+	// meant one congested link froze the render thread for seconds. The handshake
+	// still writes synchronously, before the writer exists.
+	std::mutex control_queue_mutex;
+	std::condition_variable control_queue_cv;
+	std::deque<from_headset::packets> control_queue;
+	std::jthread control_writer;
+	std::atomic<bool> control_writer_running = false;
+	std::atomic<bool> control_failed = false;
+	// Queue bound: feedback is coalesced, so this only fills up with control
+	// packets, which are rare.
+	static constexpr size_t control_queue_max = 64;
+
+	void queue_control(from_headset::packets && packet)
+	{
+		if (control_failed)
+			return;
+
+		{
+			std::lock_guard lock(control_queue_mutex);
+			// Coalesce latest-wins traffic: the server only cares about the newest
+			// feedback per stream and the newest foveation parameters.
+			if (auto * feedback = std::get_if<from_headset::feedback>(&packet))
+			{
+				std::erase_if(control_queue, [&](const auto & queued) {
+					auto * q = std::get_if<from_headset::feedback>(&queued);
+					return q and q->stream_index == feedback->stream_index;
+				});
+			}
+			else if (std::holds_alternative<from_headset::foveation>(packet))
+			{
+				std::erase_if(control_queue, [](const auto & queued) {
+					return std::holds_alternative<from_headset::foveation>(queued);
+				});
+			}
+
+			if (control_queue.size() >= control_queue_max)
+				control_queue.pop_front();
+
+			control_queue.push_back(std::move(packet));
+		}
+		control_queue_cv.notify_one();
+	}
+
+	void run_control_writer()
+	{
+		while (true)
+		{
+			from_headset::packets packet;
+			{
+				std::unique_lock lock(control_queue_mutex);
+				control_queue_cv.wait(lock, [&] {
+					return not control_queue.empty() or not control_writer_running;
+				});
+				if (not control_writer_running)
+					return;
+				packet = std::move(control_queue.front());
+				control_queue.pop_front();
+			}
+
+			try
+			{
+				// typed_socket::send takes one concrete packet type, not the
+				// variant, so dispatch on the alternative.
+				std::visit(
+				        [this](auto && concrete) {
+					        bytes_sent_ += control.send(std::forward<decltype(concrete)>(concrete));
+				        },
+				        std::move(packet));
+			}
+			catch (const std::exception & e)
+			{
+				// The socket is gone (or poisoned by a partial write). Stop writing
+				// and let the network thread perform the normal teardown.
+				control_failed = true;
+				return;
+			}
+		}
+	}
+
 	template <typename T>
 	void handshake(T address, bool tcp_only, crypto::key & headset_keypair, std::function<std::string(int fd)> pin_enter);
 
@@ -59,6 +147,7 @@ public:
 	wivrn_session(sockaddr_in address, bool tcp_only, crypto::key & headset_keypair, std::function<std::string(int fd)> pin_enter);
 	wivrn_session(const wivrn_session &) = delete;
 	wivrn_session & operator=(const wivrn_session &) = delete;
+	~wivrn_session();
 
 	// Depth of the control (TCP) send queue. Camera frames use the same socket
 	// as feedback and video keyframes; when it backs up, dropping a camera
@@ -73,6 +162,17 @@ public:
 	template <typename T>
 	void send_control(T && packet)
 	{
+		// Only real packet types go through the queue; batched spans and other
+		// serialised forms are written directly (they are not on the render path).
+		if constexpr (std::is_constructible_v<from_headset::packets, T &&>)
+		{
+			if (control_writer_running)
+			{
+				queue_control(from_headset::packets{std::forward<T>(packet)});
+				return;
+			}
+		}
+		// Handshake path (writer not started yet) or a non-packet payload.
 		bytes_sent_ += control.send(std::forward<T>(packet));
 	}
 
@@ -80,14 +180,27 @@ public:
 	void send_stream(T && packet)
 	{
 		if (stream)
+		{
 			bytes_sent_ += stream.send(std::forward<T>(packet));
-		else
-			bytes_sent_ += control.send(std::forward<T>(packet));
+			return;
+		}
+		if constexpr (std::is_constructible_v<from_headset::packets, T &&>)
+		{
+			if (control_writer_running)
+			{
+				queue_control(from_headset::packets{std::forward<T>(packet)});
+				return;
+			}
+		}
+		bytes_sent_ += control.send(std::forward<T>(packet));
 	}
 
 	template <typename T>
 	int poll(T && visitor, std::chrono::milliseconds timeout)
 	{
+		if (control_failed)
+			throw std::runtime_error("control writer stopped");
+
 		pollfd fds[2] = {};
 		fds[0].events = POLLIN;
 		fds[0].fd = stream.get_fd();

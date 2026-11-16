@@ -18,6 +18,7 @@
  */
 
 #include "wivrn_client.h"
+
 #include "application.h"
 #include "protocol_version.h"
 #include "secrets.h"
@@ -26,6 +27,7 @@
 #include "utils/i18n.h"
 #include "wivrn_packets.h"
 #include <arpa/inet.h>
+#include <deque>
 #include <ifaddrs.h>
 #include <linux/ipv6.h>
 #include <net/if.h>
@@ -232,6 +234,11 @@ wivrn_session::wivrn_session(sockaddr_in6 address, bool tcp_only, crypto::key & 
 	{
 		throw handshake_error{e.what()};
 	}
+
+	// From here on control traffic is written by this thread, so a congested
+	// socket cannot block the render or camera threads.
+	control_writer_running = true;
+	control_writer = std::jthread{[this]() { run_control_writer(); }};
 }
 
 wivrn_session::wivrn_session(sockaddr_in address, bool tcp_only, crypto::key & headset_keypair, std::function<std::string(int fd)> pin_enter) :
@@ -245,4 +252,18 @@ wivrn_session::wivrn_session(sockaddr_in address, bool tcp_only, crypto::key & h
 	{
 		throw handshake_error{e.what()};
 	}
+
+	control_writer_running = true;
+	control_writer = std::jthread{[this]() { run_control_writer(); }};
+}
+
+wivrn_session::~wivrn_session()
+{
+	{
+		std::lock_guard lock(control_queue_mutex);
+		control_writer_running = false;
+	}
+	control_queue_cv.notify_all();
+	if (control_writer.joinable())
+		control_writer.join();
 }
