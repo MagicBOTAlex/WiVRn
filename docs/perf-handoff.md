@@ -468,10 +468,23 @@ later for the next minute — a sustained +11.1 ms.
 Consequence: making a stage faster in the median moves nothing. Only tail
 reduction (or not dropping frames) can step the schedule earlier.
 
-**Do:** log at 1 Hz from `pacer::predict`: `predicted_client_render - now`,
-`safe_present_to_decoded_ns`, `mean_wake_up_to_present_ns`,
-`mean_render_to_display_ns`. Those four numbers explain the whole latency
-figure and make every other measurement interpretable.
+**Do:** `WIVRN_PACER_STATS=1` (added in `3af51c3e`) logs, once a second:
+`predicted_client_render - now`, `safe_present_to_decoded_ns`,
+`mean_wake_up_to_present_ns`, `mean_render_to_display_ns`.
+
+Measured on this setup (90 Hz, wayvr):
+
+```
+pacer: lead 23.7 ms, safe_present_to_decoded 13.6 ms,
+       wake_to_present 0.4 ms, render_to_display 20.0 ms, display_delay 33.7 ms
+```
+
+The number to attack is `safe_present_to_decoded` = **13.6 ms**: it is the
+p99.5 of the client's present→decoded interval, while the *median*
+decode + blit is only ~8.7 ms. The ~5 ms tail is what keeps the schedule a
+whole 11.1 ms display period later than it needs to be. `wake_to_present` is
+0.4 ms, so the app is not the problem; `render_to_display` (20 ms) is the
+headset compositor's present path and is not ours.
 
 Also add counters for the silent drops: `compositor.cpp:313` (encoder busy /
 disconnected / no clock), `:320` (`acquire_image() < 0`), and the sender's

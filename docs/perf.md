@@ -21,10 +21,25 @@ path. Camera passthrough is out of scope.
 `WIVRN_PIPELINE_STATS=1 wivrn-server` prints a per-stream breakdown averaged over
 90 frames, using the timestamps the headset already sends back in `feedback`:
 
+Before `c8af13eb`:
+
 ```
 stream 0 pipeline: encode 2.1  first-packet 1.7  transfer 0.0  decode 4.5  blit 8.4  display 37.0  total 53.7 ms
 stream 1 pipeline: encode 1.6  first-packet 1.7  transfer 0.0  decode 4.2  blit 7.1  display 37.0  total 51.6 ms
 ```
+
+After (wayvr, three streams, parallel encode):
+
+```
+stream 0 pipeline: encode 2.3  first-packet 1.9  transfer 0.0  decode 3.4  blit 5.8  display 17.0  total 30.4 ms
+stream 1 pipeline: encode 3.8  first-packet 1.8  transfer 0.0  decode 3.3  blit 4.5  display 17.0  total 30.4 ms
+stream 2 pipeline: encode 4.7  first-packet 1.8  transfer 0.0  decode 2.9  blit 4.0  display 17.0  total 30.4 ms
+```
+
+`encode` is higher per stream because the three NVENC sessions now run
+concurrently on one engine (their serial sum was ~4.6 ms); what matters is that
+the second eye no longer waits for the first. `display` is the term to look at:
+it is the frame waiting for its display slot, i.e. the headset's present path.
 
 | Stage | Time | What it is |
 |---|---|---|
