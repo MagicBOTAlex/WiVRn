@@ -679,6 +679,28 @@ reconnect instead of freezing. Measure with a scoped timer around the enqueue
 - Remaining to check by hand: controller inputs in a game (action filter), and
   the launcher tiles/names/icons.
 
+## 4c. The `blit` "tail" is an idle artifact, not a stall
+
+Clean 6-minute run while the headset was active: `blit` p50 4.6 ms, p99 7.6 ms,
+**max 465 ms**, yet **zero** render-thread stalls. Instrumentation
+(`debug.wivrn.stall_stats=1` / `WIVRN_STALL_STATS=1`) times the previous-frame
+fence wait, `common_frame` and the swapchain acquire/wait, and none of them
+exceeded 20 ms.
+
+Explanation: when the headset is idle no new frames are decoded, so the pacer's
+predicted display time and the frames both go stale; when rendering resumes the
+frame that matches is already hundreds of ms old, and `blitted -
+received_from_decoder` reports that age. `common_frame` did not fail (0
+"Failed to find a common frame").
+
+The pacer is **not** misled: it only accepts feedback for frames inside its
+8-entry in-flight ring (~89 ms at 90 Hz), so an idle-gap sample never enters the
+p99.5. The 90-frame pipeline mean does show it, which is why `collect.py`
+reports `max` separately from p99.
+
+Instrumentation is kept, gated: `adb shell setprop debug.wivrn.stall_stats 1`
+(or `WIVRN_STALL_STATS=1` on desktop) logs any of those three calls over 20 ms.
+
 ## 4b. Test plan for the blind-shipped changes
 
 Everything from `9f59875e` and `f64b5b5f` was written without a headset run (a

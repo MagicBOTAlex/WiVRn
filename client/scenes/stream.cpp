@@ -39,6 +39,7 @@
 #include "decoder/shard_accumulator.h"
 #include "inplace_vector.hpp"
 #include "spdlog/spdlog.h"
+#include "utils/env.h"
 #include "utils/i18n.h"
 #include "utils/named_thread.h"
 #include "utils/ranges.h"
@@ -909,8 +910,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		application::pop_scene();
 	}
 
+	// The previous frame's GPU work must be done before its command buffer and
+	// descriptors are reused. Usually instant; a long wait here means the GPU
+	// was busy for that long, which shows up as a `blit` spike.
+	static const bool stall_stats = env<std::string>("stall_stats").has_value();
+	const auto fence_start = std::chrono::steady_clock::now();
 	if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
 		throw std::runtime_error("Vulkan fence timeout");
+	if (stall_stats)
+	{
+		auto fence_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_start).count();
+		if (fence_ms > 20.0)
+			spdlog::warn("render stall: previous-frame fence {:.1f} ms", fence_ms);
+	}
 
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
@@ -937,7 +949,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	// Search for frame with desired display time on all decoders
 	// If no such frame exists, use the latest frame for each decoder
+	const auto common_start = std::chrono::steady_clock::now();
 	current_blit_handles = common_frame(frame_state.predictedDisplayTime);
+	if (stall_stats)
+	{
+		auto common_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - common_start).count();
+		if (common_ms > 20.0)
+			spdlog::warn("render stall: common_frame {:.1f} ms", common_ms);
+	}
 	std::array<XrPosef, view_count> pose;
 	std::array<XrFovf, view_count> fov{};
 	std::array<bool, view_count> valid_fov{};
@@ -1108,8 +1127,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		foveation_center.update(fov, valid_fov, swapchain, frame_state.predictedDisplayTime);
 
 		// defoveate the image, apply scale/bias
+		const auto acquire_start = std::chrono::steady_clock::now();
 		int image_index = swapchain.acquire();
-		swapchain.wait();
+		const auto acquire_end = std::chrono::steady_clock::now();
+		const bool waited = swapchain.wait();
+		const auto wait_end = std::chrono::steady_clock::now();
+		// A compositor hiccup here blocks the render thread and shows up as a
+		// multi-hundred-ms `blit` spike, which inflates the pacer's p99.5 for a
+		// minute. Opt-in, so the cost of finding out where it happens is zero in
+		// normal use.
+		// Portable: on Android this reads the `debug.wivrn.stall_stats` system
+		// property (adb shell setprop), on desktop WIVRN_STALL_STATS.
+		static const bool stall_stats = env<std::string>("stall_stats").has_value();
+		if (stall_stats)
+		{
+			auto acquire_ms = std::chrono::duration<double, std::milli>(acquire_end - acquire_start).count();
+			auto wait_ms = std::chrono::duration<double, std::milli>(wait_end - acquire_end).count();
+			if (acquire_ms > 20.0 or wait_ms > 20.0 or not waited)
+				spdlog::warn("render stall: acquire {:.1f} ms, wait {:.1f} ms ({}), total {:.1f} ms",
+				             acquire_ms,
+				             wait_ms,
+				             waited ? "ok" : "timeout",
+				             acquire_ms + wait_ms);
+		}
 
 		switch (gui_status)
 		{
