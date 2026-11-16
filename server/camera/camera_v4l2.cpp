@@ -40,7 +40,6 @@ extern "C"
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <poll.h>
 #include <set>
 #include <string>
 #include <sys/ioctl.h>
@@ -262,21 +261,8 @@ private:
 		}
 	}
 
-	// True when the v4l2 node has a free buffer, i.e. somebody is consuming.
-	// With no reader this stays false and we skip the JPEG decode entirely.
-	bool can_write() const
-	{
-		if (not streaming or fd < 0)
-			return true; // first frames: decode so configure() can run
-		pollfd p{.fd = fd, .events = POLLOUT, .revents = 0};
-		return poll(&p, 1, 0) > 0 and (p.revents & (POLLOUT | POLLERR));
-	}
-
 	void decode_and_write(from_headset::camera_frame && f)
 	{
-		if (not can_write())
-			return;
-
 		if (dead_flag and not reopen())
 			return;
 

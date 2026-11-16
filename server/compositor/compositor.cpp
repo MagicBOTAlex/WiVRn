@@ -190,6 +190,34 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::C
 	return {make_image(0), make_image(1)};
 }
 
+std::array<vk::raii::CommandPool, 2> make_command_pools(wivrn::vk_bundle & vk)
+{
+	vk::CommandPoolCreateInfo info{
+	        .flags = vk::CommandPoolCreateFlagBits::eTransient,
+	        .queueFamilyIndex = vk.queue.family_index,
+	};
+	return {vk::raii::CommandPool{vk.device, info}, vk::raii::CommandPool{vk.device, info}};
+}
+
+std::array<vk::raii::CommandBuffer, 2> make_command_buffers(
+        wivrn::vk_bundle & vk,
+        const std::array<vk::raii::CommandPool, 2> & pools)
+{
+	return {
+	        std::move(vk.device.allocateCommandBuffers({.commandPool = *pools[0], .commandBufferCount = 1})[0]),
+	        std::move(vk.device.allocateCommandBuffers({.commandPool = *pools[1], .commandBufferCount = 1})[0]),
+	};
+}
+
+std::array<vk::raii::QueryPool, 2> make_query_pools(wivrn::vk_bundle & vk)
+{
+	vk::QueryPoolCreateInfo info{
+	        .queryType = vk::QueryType::eTimestamp,
+	        .queryCount = 3,
+	};
+	return {vk::raii::QueryPool{vk.device, info}, vk::raii::QueryPool{vk.device, info}};
+}
+
 vk::raii::Semaphore make_semaphore(wivrn::vk_bundle & vk)
 {
 	vk::raii::Semaphore res{
@@ -308,9 +336,47 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        .alpha = layer_accum.data.env_blend_mode == XRT_BLEND_MODE_ALPHA_BLEND,
 	};
 
+	// Wait for the previous frame's GPU work before reusing its command buffer,
+	// descriptor sets and squash target. The GPU had a whole frame to finish, so
+	// this normally returns immediately; it is not a per-frame stall.
+	if (have_pending_frame)
+	{
+		const vk::Result wait = vk.device.waitSemaphores(
+		        vk::SemaphoreWaitInfo{
+		                .semaphoreCount = 1,
+		                .pSemaphores = &*sem,
+		                .pValues = &pending_sem_value,
+		        },
+		        U_TIME_1S_IN_NS);
+		if (wait == vk::Result::eTimeout)
+			U_LOG_IFL_W(log_level, "compositor timeout waiting for the previous frame");
+		else
+		{
+			auto [res, ts] = query_pools[frame_parity ^ 1].getResults<uint64_t>(
+			        0,
+			        3,
+			        3 * sizeof(uint64_t),
+			        sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64);
+			if (res == vk::Result::eSuccess)
+			{
+				static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
+				squasher_times.add((ts[1] - ts[0]) * period / 1e3);
+				foveation_times.add((ts[2] - ts[1]) * period / 1e3);
+			}
+			// Only collect swapchains once the frame referencing them is done.
+			comp_swapchain_shared_garbage_collect(&cscs);
+		}
+	}
+	frame_parity ^= 1;
+	have_pending_frame = false;
+
+	auto & cmd = cmds[frame_parity];
+	auto & query_pool = query_pools[frame_parity];
+
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
-	cmd_pool.reset();
+	cmd_pools[frame_parity].reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
 	cmd.resetQueryPool(*query_pool, 0, 3);
@@ -500,34 +566,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	comp_frame_clear_locked(&frame.rendering);
 
-	if (vk.device.waitSemaphores(vk::SemaphoreWaitInfo{
-	                                     .semaphoreCount = 1,
-	                                     .pSemaphores = &*sem,
-	                                     .pValues = &sem_info.value,
-	                             },
-	                             U_TIME_1S_IN_NS) == vk::Result::eTimeout)
-	{
-		U_LOG_IFL_W(log_level, "compositor timeout");
-	}
-	else
-	{
-		auto [res, ts] = query_pool.getResults<uint64_t>(
-		        0,
-		        3,
-		        3 * sizeof(uint64_t),
-		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-
-		if (res == vk::Result::eSuccess)
-		{
-			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
-			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
-		}
-	}
-
-	// Now is a good point to garbage collect.
-	comp_swapchain_shared_garbage_collect(&cscs);
+	// Do not wait for the GPU here: the next layer_commit waits for this frame
+	// at its start, which keeps xrEndFrame (a synchronous IPC round trip) off
+	// the GPU critical path.
+	pending_sem_value = sem_info.value;
+	have_pending_frame = true;
 
 	return XRT_SUCCESS;
 }
@@ -676,17 +719,11 @@ compositor::compositor(wivrn_session & session) :
         },
         log_level(debug_get_log_option_log()),
         session(session),
-        cmd_pool(vk.device, vk::CommandPoolCreateInfo{
-                                    .flags = vk::CommandPoolCreateFlagBits::eTransient,
-                                    .queueFamilyIndex = vk.queue.family_index,
-                            }),
-        query_pool(vk.device, vk::QueryPoolCreateInfo{
-                                      .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 3,
-                              }),
+        cmd_pools(make_command_pools(vk)),
+        query_pools(make_query_pools(vk)),
+        cmds(make_command_buffers(vk, cmd_pools)),
         settings(get_encoder_settings(vk, session)),
-        images{make_images(vk, cmd_pool, settings)},
-        cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1})[0])},
+        images{make_images(vk, *cmd_pools[0], settings)},
         sem{make_semaphore(vk)},
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),

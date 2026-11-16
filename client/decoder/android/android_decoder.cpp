@@ -246,42 +246,26 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 	}
 
 	if (partial)
-	{
-		// Hand the decoder what has arrived so far: waiting for the whole frame
-		// adds the entire transmission time (several ms) to the latency.
-		if (partial_frames and current_input_buffer.data_size >= 32 * 1024)
-			queue_current(AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME);
 		return;
-	}
 
-	queue_current(0);
+	queue_current();
 }
 
-void decoder::queue_current(uint32_t flags)
+void decoder::queue_current()
 {
 	input_buffer buf = current_input_buffer;
 	current_input_buffer = input_buffer{};
 	if (buf.data == nullptr)
 		return;
 
-	jobs.push([this, buf, mc = media_codec.get(), flags]() mutable {
+	jobs.push([this, buf, mc = media_codec.get()]() mutable {
 		uint64_t timestamp = buf.frame_index * 10'000;
-		auto status = AMediaCodec_queueInputBuffer(mc, buf.idx, 0, buf.data_size, timestamp, flags);
+		auto status = AMediaCodec_queueInputBuffer(mc, buf.idx, 0, buf.data_size, timestamp, 0);
 		if (status != AMEDIA_OK)
 		{
-			if (flags & AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME)
-			{
-				// The codec does not support partial frames: stop using them and
-				// drop this frame (the next one is queued whole).
-				partial_frames = false;
-				spdlog::warn("MediaCodec rejected a partial frame, falling back to whole-frame input");
-			}
-			else
-			{
-				spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
-				              int(status),
-				              std::string(magic_enum::enum_name(status)).c_str());
-			}
+			spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
+			              int(status),
+			              std::string(magic_enum::enum_name(status)).c_str());
 			buf.data_size = 0;
 			buf.frame_index = 0;
 			input_buffers.push(std::move(buf));

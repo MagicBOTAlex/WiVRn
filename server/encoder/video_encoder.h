@@ -72,8 +72,6 @@ private:
 		void push(data &&);
 		static std::shared_ptr<sender> get();
 		void wait_idle(video_encoder *);
-		// Non-blocking: true while this encoder still has data being sent.
-		bool has_pending(video_encoder *);
 	};
 
 public:
@@ -84,7 +82,7 @@ public:
 	// or init() and read by the compositor on every layer_commit — must not
 	// change after the first frame.
 	vk::ImageLayout target_layout = vk::ImageLayout::eGeneral;
-	static const uint8_t num_slots = 3;
+	static const uint8_t num_slots = 2;
 	const double bitrate_multiplier;
 
 private:
@@ -92,7 +90,7 @@ private:
 	static const state_t idle = 0;
 	static const state_t busy = 1;
 	static const state_t skip = 2;
-	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle, idle};
+	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle};
 	uint8_t present_slot = 0;
 	uint8_t encode_slot = 0;
 

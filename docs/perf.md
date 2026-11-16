@@ -1,143 +1,78 @@
-# Performance notes
+# Performance notes (NVIDIA streaming path)
 
-This page records the performance work done on the camera-passthrough fork and how
-to reproduce the measurements. It is a work in progress: the low-risk fixes are
-in, the architectural ones are listed at the end.
+Scope: the PC-side stream (NVENC encode → send) and the client decode/present
+path. Camera passthrough is out of scope.
+
+## Where the 50 ms actually goes
+
+`WIVRN_PIPELINE_STATS=1 wivrn-server` prints a per-stream breakdown averaged over
+90 frames, using the timestamps the headset already sends back in `feedback`:
+
+```
+stream 0 pipeline: encode 2.1  first-packet 1.7  transfer 0.0  decode 4.5  blit 8.4  display 37.0  total 53.7 ms
+stream 1 pipeline: encode 1.6  first-packet 1.7  transfer 0.0  decode 4.2  blit 7.1  display 37.0  total 51.6 ms
+```
+
+| Stage | Time | What it is |
+|---|---|---|
+| encode | 1.6-2.1 ms | NVENC AV1 10-bit, 1280x1344 |
+| first packet | 1.7 ms | encode end → first shard on the headset |
+| decode | 4.2-4.5 ms | MediaCodec, whole frame |
+| blit | 7.1-8.4 ms | decode done → defoveate submitted |
+| display | ~37 ms | submitted → photons (the frame waits for its display slot) |
+| **total** | **~52 ms** | encode start → photons |
+
+The `display` term is mostly *slack*: the frame is ready about 37 ms before the
+headset's compositor shows it. The active work is encode 2 + network 2 + decode
+4.5 + blit 8 ≈ 17 ms, plus the app's own render time and the compositor's present
+latency.
+
+This is why the encoder is not the lever: a perfect NVENC would save ~2 ms out of
+52. The controllable client terms are `blit` (8 ms) and `decode` (4.5 ms).
+
+## What this branch changes (kept)
+
+| Change | Effect | Quality |
+|---|---|---|
+| `layer_commit`: two command buffers/query pools, wait for the previous frame at the *start* instead of the current frame at the end | removes a GPU wait from the synchronous `xrEndFrame` IPC round trip; the GPU has a whole frame to finish, so the start wait is normally zero | neutral |
+| `poll_actions()` after `xrWaitFrame()` | input is no longer one frame stale (~11 ms at 90 Hz) | neutral |
+| `shard_accumulator`: O(1) completeness, reused payload buffer, no per-shard lock | removes ~450 allocations/frame on the receive thread | neutral |
+| MediaCodec: low-latency mode, `max-input-size`, non-blocking input buffer with return-on-failure | decoder no longer buffers an extra frame; receive thread can never stall on a full input pool | neutral |
+| Server built `-O3` (flake no longer forces `-Og`), APK `-O3` | 2.4x on per-pixel server loops | neutral |
+| UDP send buffer 512 KB (kernel doubles it to 1 MB), DSCP EF | bounds queueing somewhat | neutral |
+| sRGB `pow()` → polynomial in the reprojection shader | max error 0.019/255 | neutral |
+
+## Reverted (were wrong)
+
+- **Client blit target capped at the panel.** This reduced submitted resolution
+  (2476x2594 → 2064x2162), i.e. it removed supersampling. Not an optimization.
+- **Encoder drops a frame when the sender is busy.** Frame loss, and it can stall
+  the IDR state machine for ~1.1 s. `wait_idle` is restored.
+- **3 encoder slots.** The compositor only owns 2 images, so the third slot did
+  nothing but use VRAM.
+- **MediaCodec partial frames.** At 34 KB/frame the 32 KB threshold split every
+  frame into two buffers; no measured benefit, and abandoned partial frames could
+  corrupt the next frame.
+- **Camera `can_write()`.** v4l2loopback returns `POLLOUT` unconditionally on an
+  output node, so the check was a no-op (one syscall per frame). Removed.
+
+## Next, in order
+
+1. **Client blit (8 ms).** Time `waitForFences` / `swapchain.wait()` first; if
+   they are significant, double-buffer the blit command buffer/fence so the CPU
+   does not wait for the previous frame's GPU work.
+2. **Encode the two eyes concurrently** (`compositor::encoder_work` calls
+   `encode()` serially; NVENC AV1 runs ~90% in parallel on two sessions). ~1.4 ms.
+3. **Detile copy**: `vkCmdCopyImageToBuffer` converts the tiled YCbCr image to a
+   linear buffer for NVENC every frame (0.25-0.5 ms/eye). Measure with Perfetto
+   (`nvenc_copy` slice; requires `-DWIVRN_USE_PERFETTO=ON`, currently off) before
+   rewriting the foveation shader to store into the NVENC buffer directly.
+4. **Display scheduling** (37 ms slack) is the largest term but lives in the
+   headset compositor's present path, not in WiVRn.
 
 ## Benchmark
 
-`tools/bench.sh <label> [seconds]` runs a fixed VR workload and prints:
-
-- server CPU (% of one core, worker process)
-- headset CPU (% of one core) and the five busiest threads
-- camera frames/s for `/dev/video10` and `/dev/video11`
-- dropped/incomplete video frames from logcat
-- a screenshot of the WiVRn statistics page
-
-The workload is `hello_xr -g Vulkan -s Local` by default; `VRBENCH_APP=wayvr` gives
-a real stream with a running app. The server is started if none is running
-(`SERVER_BIN` overrides the binary).
-
-```bash
-# terminal 1: a server built with the features you want to test
-./build-server-opt/server/wivrn-server
-
-# terminal 2
-VRBENCH_APP=wayvr tools/bench.sh baseline 20
-```
-
-Reading the numbers:
-
-- the headset CPU is dominated by the render thread (`Thread-3`) and the decoder
-  (`HwBinder`/`NDK`/`ImageReader` threads);
-- `frames not sent` / `late shards` must stay at 0 on a healthy link;
-- the statistics page shows CPU time, GPU time (defoveate), network rate and
-  "estimated motion to photons latency".
-
-## Baseline (before this branch)
-
-Measured on the same machine (RTX 4080 SUPER, Quest 3, Wi-Fi 6 at 1200 Mbit/s,
-RSSI -37 dBm):
-
-| Metric | Value |
-|---|---|
-| Encoder | NVENC AV1 10-bit, 1280x1344/eye, 24.6 Mbit/s |
-| Client config | `resolution_scale=1.2`, `stream_scale=0.5`, 90 Hz, 10-bit |
-| Camera A (`/dev/video10`, EPOS, bulk) | 30.0 fps, p95 40 ms |
-| Camera B (`/dev/video11`, iso) | 7.8 fps, p95 131 ms — device-limited, **0 frames dropped** |
-| Camera uplink (TCP control socket) | 6.0 Mbit/s |
-| Control-socket RTT | 27.5 ms SRTT / 2.3 ms min |
-| Server CPU (lobby) | 6.5 % |
-| Headset CPU (lobby) | 58 % |
-| Motion to photons | ~70 ms |
-| GPU defoveate | 2-7 ms |
-| Wi-Fi retries | 1.1 % |
-
-Camera B's 7.8 fps is not a passthrough bug: the UVC counters show 0 dropped
-frames and the frame intervals are a rock-steady 128 ms. The camera itself is
-pacing (it is a cheap UVC module in a dark room, likely exposure-limited). Camera
-A does 30 fps on the same bus.
-
-## What changed on this branch
-
-| Change | Why |
-|---|---|
-| `poll_actions()` moved after `xrWaitFrame()` | input was one full frame stale (~11 ms at 90 Hz) |
-| `shard_accumulator`: O(1) completeness (`contiguous`), reused payload vector, no per-shard `shared_lock` | the receive path allocated a vector **per shard** (~225-450/frame) and rescanned the whole frame per shard |
-| MediaCodec `low-latency`, QTI low-latency key, `max-input-size` | the default decoder keeps extra internal buffering (~1 frame) |
-| Partial-frame input (`AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME`, 32 KB threshold) with automatic fallback | decode started only after the whole frame had arrived (4-12 ms at 100-200 Mbit/s) |
-| Non-blocking codec input (`try_pop`) and buffer return on queue failure | a full input pool blocked the receive thread forever |
-| Camera decode moved to a per-camera worker thread, `AVPacket`/`AVFrame` reused | MJPEG decode (1.5-6 ms/frame) ran on the session thread and delayed tracking |
-| sRGB `pow()` → polynomial in the reprojection shader | ~3 transcendentals per pixel over a full eye |
-| Server built at `-O3` (flake no longer forces `-Og`); APK at `-O3` | `enableDebugging` injected `-Og` into every server TU (2.4x on the camera conversion loop) |
-| UDP send buffer 5 MB → 512 KB, DSCP EF | bounded queueing delay under congestion; Wi-Fi WMM video AC |
-| Render thread priority -4 (Android) | keep the render thread ahead of decode/network/camera threads |
-| Loss-path logs demoted to debug | the packet-loss path logged several lines per frame on the network thread |
-| Encoder: 3 slots, drop instead of `wait_idle` | the app thread waited for the previous frame's socket writes; now a busy sender drops a frame instead of stalling |
-| Client blit target capped at the panel size | the foveation mesh was rendered at `resolution_scale` (1.2x) the panel; the extra detail is discarded by the display |
-
-## Results after
-
-Same workload (`wayvr` streaming, 2 cameras, 20 s runs):
-
-| Metric | Before | After |
-|---|---|---|
-| Camera A fps | 30.0 | 30.0 |
-| Camera B fps | 7.8 | 7.8 (device-limited) |
-| Dropped frames | 0 | 0 |
-| Server CPU (streaming) | 13.2 % (-Og) | 13.0 % (-O3) |
-| Headset CPU (streaming) | ~104 % | ~104 % |
-| Motion to photons | ~70 ms | 56-58 ms |
-| Client blit target | 2476x2594 | 2064x2162 (panel) |
-| CPU time / frame (overlay) | 10-18 ms | 8-13 ms |
-
-The server/headset CPU counters did not move much: the stream is GPU/NVENC-bound
-and the remaining CPU is spread across decode and compositing. The wins on this
-branch are latency and jitter (input, decode start, session-thread stalls, encode
-stalls) and GPU fill (blit target). Measuring them needs the feedback timestamps
-(`encode_begin` … `displayed`), the in-headset statistics overlay, or a
-high-speed camera on the panel.
-
-Note that the headset CPU% varies by 30-50% between runs with the same scene
-(thermal state, Wi-Fi retries, how much of wayvr is on screen); compare CPU time
-per frame from the overlay rather than the process-wide percentage.
-
-## Where the remaining time goes
-
-From the reviews (ranked by expected gain):
-
-1. **Server `layer_commit` waits for the GPU every frame** (`compositor.cpp`) to
-   read timestamp queries that only feed debug graphs. Removing it needs
-   double-buffered command buffers/descriptor sets/squash target; worth ~1-2 ms
-   and real CPU/GPU overlap. This is the largest remaining latency item.
-2. **Per-slot NVENC bitstream buffers**: the encoder still has one bitstream
-   buffer, so a busy sender drops a frame (done) rather than encoding ahead.
-   Encoding one frame ahead would remove the drop and smooth bursts.
-3. **Camera frames share the TCP control socket** with feedback. A camera frame
-   can delay feedback and, on a stalled socket, the session. Moving camera frames
-   to the UDP stream path (they are all keyframes) removes that coupling.
-5. **Adaptive bitrate**: `feedback` has no loss/queue signal, so the bitrate is a
-   static slider. A simple delay-based controller would improve quality per bit
-   and avoid loss→IDR amplification.
-6. **Input action reads**: ~120 `xrGetActionState*` per frame; filtering to the
-   bound interaction profile would cut ~80 % of them (0.2-0.5 ms/frame).
-
-## Reproducing the A/B
-
-```bash
-# optimised server
-cmake -B build-server-opt . -GNinja -DWIVRN_BUILD_CLIENT=OFF \
-  -DWIVRN_BUILD_DASHBOARD=OFF -DCMAKE_BUILD_TYPE=Release -DWIVRN_USE_NVENC=ON
-cmake --build build-server-opt -j$(nproc)
-
-# old-style debug build for comparison
-cmake -B build-server . -GNinja -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_DASHBOARD=OFF
-cmake --build build-server -j$(nproc)
-```
-
-Verify the flags actually differ:
-
-```bash
-llvm-dwarfdump --debug-info build-server/server/wivrn-server | grep -m1 DW_AT_producer
-# must end with -O2/-O3, not -Og
-```
+`tools/bench.sh <label> [seconds]` runs a fixed VR workload, samples server and
+headset CPU per thread, camera fps, frame loss, and saves the statistics
+screenshot. Use `VRBENCH_APP=wayvr` for a real stream. Compare CPU time per frame
+from the overlay, not process-wide CPU% (which swings 30-50% with thermal state).

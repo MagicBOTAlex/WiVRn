@@ -946,25 +946,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		max_height = std::max(max_height, extents[i].height);
 	}
 
-	// The foveation parameters describe the server's render extent, which is
-	// resolution_scale times the panel. Blitting into a larger target than the
-	// panel throws that detail away, so cap it at the panel size: the defoveator
-	// scales the mesh to fit.
 	if (max_width > 0 and max_height > 0)
-	{
-		const auto & traits = application::get_hmd_traits();
-		if (traits.panel_width_override and width > 0)
-		{
-			max_width = std::min(max_width, int32_t(traits.panel_width_override));
-			max_height = std::min(max_height, int32_t(int64_t(height) * traits.panel_width_override / width));
-		}
-		else
-		{
-			max_width = std::min(max_width, int32_t(width));
-			max_height = std::min(max_height, int32_t(height));
-		}
 		ensure_swapchain(foveation_center.is_cropped(fov, valid_fov), max_width, max_height);
-	}
 
 	session.begin_frame();
 

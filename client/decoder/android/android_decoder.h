@@ -95,10 +95,6 @@ private:
 		uint8_t * data = nullptr;
 	};
 
-	// Set once the codec has rejected a partial frame (unsupported); then every
-	// frame is queued whole.
-	std::atomic<bool> partial_frames{true};
-
 	utils::sync_queue<input_buffer> input_buffers;
 	input_buffer current_input_buffer; // Only accessed in network thread
 	utils::sync_queue<std::function<bool(void)>> jobs;
@@ -120,7 +116,7 @@ private:
 	vk::raii::RenderPass renderpass = nullptr;
 
 	// Queue the accumulated input buffer to MediaCodec and take a new one.
-	void queue_current(uint32_t flags);
+	void queue_current();
 
 	void create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format);
 	std::shared_ptr<mapped_hardware_buffer> map_hardware_buffer(AImage *);

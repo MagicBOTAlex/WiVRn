@@ -840,6 +840,46 @@ void wivrn_session::operator()(from_headset::feedback && feedback)
 		trace::instant_feedback("blit", o.from_headset(feedback.blitted), feedback.frame_index, feedback.stream_index);
 	if (feedback.displayed)
 		trace::instant_feedback("display", o.from_headset(feedback.displayed), feedback.frame_index, feedback.stream_index);
+
+	// Pipeline breakdown, averaged over a second of frames. All values are
+	// headset-clock deltas, so they are directly comparable. Opt-in: it is a
+	// diagnostic, not something to log in normal use.
+	static const bool pipeline_stats = getenv("WIVRN_PIPELINE_STATS") != nullptr;
+	struct stage_stats
+	{
+		double encode = 0, first = 0, transfer = 0, decode = 0, blit = 0, display = 0, total = 0;
+		int n = 0;
+	};
+	thread_local std::array<stage_stats, 3> stats;
+	if (not pipeline_stats or feedback.stream_index >= stats.size())
+		return;
+	auto & st = stats[feedback.stream_index];
+	if (feedback.encode_begin and feedback.encode_end and feedback.send_begin and
+	    feedback.received_first_packet and feedback.received_last_packet and
+	    feedback.sent_to_decoder and feedback.received_from_decoder and
+	    feedback.blitted and feedback.displayed)
+	{
+		st.encode += (feedback.encode_end - feedback.encode_begin) / 1e6;
+		st.first += (feedback.received_first_packet - feedback.send_begin) / 1e6;
+		st.transfer += (feedback.received_last_packet - feedback.received_first_packet) / 1e6;
+		st.decode += (feedback.received_from_decoder - feedback.sent_to_decoder) / 1e6;
+		st.blit += (feedback.blitted - feedback.received_from_decoder) / 1e6;
+		st.display += (feedback.displayed - feedback.blitted) / 1e6;
+		st.total += (feedback.displayed - feedback.encode_begin) / 1e6;
+		if (++st.n >= 90)
+		{
+			U_LOG_I("stream %u pipeline: encode %.1f first-packet %.1f transfer %.1f decode %.1f blit %.1f display %.1f total %.1f ms",
+			        unsigned(feedback.stream_index),
+			        st.encode / st.n,
+			        st.first / st.n,
+			        st.transfer / st.n,
+			        st.decode / st.n,
+			        st.blit / st.n,
+			        st.display / st.n,
+			        st.total / st.n);
+			st = {};
+		}
+	}
 }
 
 void wivrn_session::operator()(from_headset::battery && battery)

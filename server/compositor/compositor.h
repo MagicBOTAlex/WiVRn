@@ -80,13 +80,18 @@ private:
 	timings foveation_times;
 	wivrn_session & session;
 	vk_bundle vk;
-	vk::raii::CommandPool cmd_pool;
-	vk::raii::QueryPool query_pool;
+	// Two frames in flight: the app thread must not wait for the GPU at the end
+	// of layer_commit (xrEndFrame is a synchronous IPC round trip).
+	std::array<vk::raii::CommandPool, 2> cmd_pools;
+	std::array<vk::raii::QueryPool, 2> query_pools;
+	std::array<vk::raii::CommandBuffer, 2> cmds;
+	uint8_t frame_parity = 0;
+	uint64_t pending_sem_value = 0;
+	bool have_pending_frame = false;
 
 	std::array<encoder_settings, 3> settings;
 
 	std::array<image, 2> images;
-	vk::raii::CommandBuffer cmd;
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 
