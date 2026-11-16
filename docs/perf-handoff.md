@@ -5,6 +5,10 @@ Audience: whoever continues this. Read this before changing anything; several
 "obvious" optimizations were tried and reverted because they traded quality or
 dropped frames.
 
+> **Blocker — green screen every ~10 min (correctness, not perf).** Do not start
+> T1–T7 until T8 (§4) is fixed. See the new T8 section below; it is
+> prioritised above all perf items.
+
 ---
 
 ## 1. Objective and scope
@@ -103,6 +107,140 @@ grep 'pipeline: encode' .build/server-bench.log | tail
 ---
 
 ## 4. Plan (do in this order)
+
+**Order:** **T8 first (critical correctness).** Perf work (T1–T7) should not
+start until the green-screen root cause in T8 is fixed and verified over
+>10 min without a decode error. T1–T7 are unchanged below.
+
+### T8 — Green screen every ~10 min (debugging) — critical correctness, do before perf
+
+**Symptom:** decoding error every ~10 min; the screen goes everything green
+with only moving things updating (moving luma updates, static areas stay
+green). No code timer fires at 600 s — the period comes from the transport
+trigger (see below), not an app timer.
+
+**Ranked causes (five hunt agents converged):**
+
+1. **Infinite GOP + purely feedback-driven IDR + lying feedback (highest).**
+   - NVENC uses infinite GOP: `config.gopLength = NVENC_INFINITE_GOPLENGTH`
+     (`server/encoder/video_encoder_nvenc.cpp:224`) and `idrPeriod =
+     NVENC_INFINITE_GOPLENGTH` for H.264/HEVC/AV1
+     (`server/encoder/video_encoder_nvenc.cpp:278`, `:295`, `:311`).
+   - Server IDR is purely feedback-driven: `server/encoder/idr_handler.cpp:49`
+     (`running` only flips to `need_idr` when `!f.sent_to_decoder`) and
+     `:118-126` (`running` only forces an I-frame when `frame_index >
+     last_ack + 60` — a large stale window). One dropped reference frame is
+     therefore never replaced except by client feedback.
+   - Client feedback can lie. `client/decoder/shard_accumulator.cpp:193-215`
+     sets `sent_to_decoder` for the completed frame and forwards feedback
+     even when `decoder_->push_data` silently dropped it:
+     `client/decoder/android/android_decoder.cpp:224-226` (`try_pop` empty
+     → `return`) and `:238-242` (oversize > buffer → `return`). The server
+     sees `sent_to_decoder != 0`, advances `last_ack`
+     (`server/encoder/idr_handler.cpp:57-58`), and never requests a new IDR.
+     One dropped reference poisons the DPB forever (infinite GOP means no
+     periodic recovery).
+   - The error path cannot recover either: `on_media_error` sends feedback
+     with `frame_index` unset (0) (`client/decoder/android/android_decoder.cpp:528-541`),
+     which matches neither `idr_id` nor `last_ack`, so `idr_handler.cpp:28-62`
+     ignores it.
+2. **2-frame shard window drops late IDR.** The accumulator keeps only
+   `current`/`next` (`client/decoder/shard_accumulator.cpp:121-125`,
+   `:144-152`; `frame_diff > 2` resets both). An IDR on TCP
+   (`server/encoder/video_encoder_nvenc.cpp:600`) racing P-shards on UDP
+   (`server/encoder/video_encoder.cpp:316`) can land outside the window and be
+   discarded as "old"/reset, while feedback still claims success for the
+   preceding (reference-less) frame.
+3. **Intra refresh interacts with Quest AV1 SWITCH frames.** `intra_refresh_period
+   = 100`, `intra_refresh_cnt = 50`
+   (`server/encoder/video_encoder_nvenc.cpp:249-264`, applied to all codecs at
+   `:278-312`). With infinite GOP the only intra refresh is this rolling
+   refresh; the Quest AV1 decoder's SWITCH-frame handling can mis-handle
+   partially refreshed references, leaving a corrupt reference that decodes
+   luma for moving regions but leaves static regions green until a full IDR.
+4. **Transport trigger (~600 s) + blocking send.** No 600 s timer exists in
+   the code. The ~10 min period matches the Wi‑Fi `wpa_group_rekey=600` rekey/
+   scan visible on the wire (EAPOL). During that window, the blocking UDP send
+   (`common/wivrn_sockets.cpp:355-383`, `server/driver/wivrn_connection.cpp:267`
+   — 512 KB buffer, blocking socket) can stall the sender, and
+   `video_encoder::sender::wait_idle` blocks the encode path
+   (`server/encoder/video_encoder.cpp:84-89`, called from `:212` and `:272`),
+   widening the loss window so cause #1 fires. Trigger, not root cause.
+5. **Encoder hygiene (contributing, not primary):** `nvEncMapInputResource`
+   every frame, never unmapped (`server/encoder/video_encoder_nvenc.cpp:550`);
+   `frameIdx = 0` hardcoded on every frame (`:559`); serial `encoder_work`
+   try/catch slot desync (`server/compositor/compositor.cpp:655`,
+   `:670-683` — one encoder exception skips the sibling stream).
+
+**Mechanism — why moving luma updates + static green:** the decoder DPB holds
+a broken/corrupt reference. AV1 P-frames predict from that reference; blocks
+that move carry enough new luma residual to re-decoder visible changes, while
+static (zero-residual) blocks are copied from the green-corrupt reference and
+stay green. With infinite GOP there is no periodic IDR to clean the DPB, and
+(or) feedback says the corrupt frames were "sent to decoder", so the server
+keeps emitting P-frames indefinitely. Only a hunted IDR (or a codec flush)
+clears it.
+
+**Why periodic ~10 min:** the Wi‑Fi group rekey/scan at ~600 s
+(`wpa_group_rekey=600`) is the likely trigger that creates the loss/stall
+window in which the lying-feedback poison in cause #1 occurs. It is a
+trigger, not an app timer; the bug is that any single dropped reference is
+fatal under infinite GOP + feedback-only IDR.
+
+**Confirmation steps (do these first, no fixes yet):**
+- `WIVRN_DUMP_VIDEO` (checked at `server/encoder/video_encoder.cpp:164`):
+  dump server-side encoded frames around the failure and decode them
+  offline; a corrupt/green decoded frame that is present on the wire means a
+  missing reference, not a transport loss.
+- Log correlation: server `frame_idx` / `last_ack` (`idr_handler.cpp:52-54`),
+  "IDR frame needed" / "stale decoder" / "inconsistent IDR state"
+  (`idr_handler.cpp:51`, `:121`, `:129`), client "Drop shard for old frame"
+  (`shard_accumulator.cpp:122`), "data to decode is larger than decoder
+  buffer" (`android_decoder.cpp:240`), "Mediacodec error"
+  (`android_decoder.cpp:530`). Expect: a drop/error, then `sent_to_decoder`
+  feedback with no IDR for a long run, then the green screen.
+- `tcpdump` for EAPOL (group rekey) on the Wi‑Fi interface, timestamped
+  against the decode error; check whether errors align with rekeys (~600 s).
+  No EAPOL at error time weakens the transport-trigger half of the theory and
+  focuses on cause #1/2.
+
+**Fix tasks (after confirmation):**
+- Finite `idrPeriod` — bound the GOP (e.g. a real period instead of
+  `NVENC_INFINITE_GOPLENGTH` at `video_encoder_nvenc.cpp:224`, `:278`, `:295`,
+  `:311`) so one bad reference self-heals even if feedback lies.
+- Honest `push_data` feedback — propagate drop/oversize from
+  `android_decoder.cpp:224-242` through `shard_accumulator.cpp:193-215` so
+  `sent_to_decoder` is only set when the frame actually reached the decoder
+  input buffer; set a distinct "dropped" feedback that `idr_handler.cpp:49`
+  treats as `need_idr`.
+- Send a real `frame_index` in `on_media_error`
+  (`android_decoder.cpp:528-541`) — the current `frame_index=0` payload never
+  matches `idr_id`/`last_ack` and is ignored; also handle the non-`MALFORMED`
+  path.
+- `AMediaCodec_flush` on error — flush the decoder DPB on `MALFORMED` (and
+  wire it to an IDR request), rather than relying on the next feedback loop.
+- Decode-confirm gate — do not advance `last_ack` (`idr_handler.cpp:57-58`) on
+  `sent_to_decoder` alone; require decoder confirmation (or bound the
+  `last_ack + 60` stale window at `:118-126`).
+- Counter logging — log drop/oversize/`try_pop` counters with `frame_index`
+  on both sides so the poison frame (`frame_index` dropped but "sent")
+  is directly visible in the correlated logs.
+- `nvEncMapInputResource` map-once (`video_encoder_nvenc.cpp:550` — map at
+  init, unmap at destroy) and stop hardcoding `frameIdx = 0` (`:559`).
+- Per-encoder try/catch in `encoder_work` (`compositor.cpp:670-683`) so one
+  stream's exception cannot skip/desync the other.
+- Bounded `wait_idle` (`video_encoder.cpp:84-89`) — it currently waits
+  indefinitely in 100 ms slices; bound it and drop/skip rather than stalling
+  the encode path.
+- Non-blocking UDP send (`wivrn_sockets.cpp:355-383`,
+  `wivrn_connection.cpp:267`) — make oversized/full-buffer sends drop
+  (mark frame lost so feedback triggers IDR) instead of blocking.
+  (Also fix `set_tos` IPV6_TCLASS, `:269` — see T7.)
+
+**Accept:** no green screen / decode error over ≥3× the ~10 min period on the
+same Wi‑Fi setup, correlated logs show an IDR following the first observed
+drop, and decoded `WIVRN_DUMP_VIDEO` output has no corrupt reference.
+Then (and only then) resume T1–T7.
 
 ### T1 — Client blit pipelining (biggest controllable client term: 4–8 ms)
 
