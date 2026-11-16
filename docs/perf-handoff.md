@@ -544,6 +544,41 @@ first.
 Two OpenXR apps cannot share the session: whichever connects last owns it and
 the other idles, which silently invalidates a measurement.
 
+### T12 — Session robustness (partly done in `3733263a`)
+
+Fixed: single-instance lock (a second server unlinked the first's IPC socket),
+active runtime registered for the server lifetime, TCP poisoned after a partial
+write, dropped UDP datagram → immediate keyframe request, UDP send buffer
+192 KB, 30 s stall threshold.
+
+Still open, from the overnight audit:
+
+1. **The client render thread can block up to 5 s in `send_control`**
+   (`client/scenes/stream.cpp:1281`, `common/wivrn_sockets.cpp:570-600`): the
+   TCP socket is blocking and its mutex is shared with the image-reader,
+   tracking and camera threads. This is the actual source of multi-second
+   `blit` spikes, not the GPU. Fix: non-blocking control socket plus a
+   coalescing sender thread (keep newest feedback per stream).
+2. **Keyframes are one unsharded ~1 MB TCP message** (`video_encoder.cpp:330`).
+   It blocks the single sender thread for its whole transmission, and the
+   following P-frames overtake it over UDP. Fix: shard to 8-16 KB and gate the
+   stream's P-frames until the keyframe drains (bounded).
+3. **Camera frames share the control socket** with feedback/keyframes/audio
+   (29 Mbit/s measured). A second TCP connection (or UDP sharding) removes the
+   head-of-line coupling. Interim mitigation is in place (drop when backlogged).
+4. **Pacer**: `safe_present_to_decoded` is a p99.5 over 5000 *surviving*
+   frames, so late/dropped frames are censored and the estimate is optimistic;
+   `last_ns` ratchets permanently after a stall. Consider a decaying quantile
+   plus a missed-frame counter, and de-ratchet the bump.
+5. **Client `set_state`** is a single `compare_exchange_strong` without a retry
+   loop; a race with `push_blit_handle` can leave the scene state inconsistent.
+6. **Action polling** queries ~120 actions when ~25 are bound (0.2-0.5 ms);
+   filter by the active interaction profile and re-scan on profile change.
+7. **App list**: the server-side list is correct (`common/list-apps` prints
+   wayvr, Beat Saber, VRChat), but a tile can render without its name/icon when
+   the game lives in a secondary Steam library — the icon lookup only checks
+   the main library's `steam/games`.
+
 ### T10 — Remaining measured items (small, low risk)
 
 - `client/scenes/stream.cpp:910-915`: `getResults(..., eWait)` is redundant
