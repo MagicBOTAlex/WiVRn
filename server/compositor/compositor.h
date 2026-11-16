@@ -136,6 +136,11 @@ private:
 
 	xrt_result_t begin_session(const xrt_begin_session_info * info)
 	{
+		// The headset only learns the stream parameters from this packet, and it
+		// is also what makes it switch to the stream scene. It used to be sent
+		// only when the headset connected, so a client that fell back to the app
+		// list could never get back into the stream while the app kept running.
+		send_video_stream_description();
 		return XRT_SUCCESS;
 	};
 	xrt_result_t end_session()
