@@ -6,6 +6,13 @@ path. Camera passthrough is out of scope.
 > **Continuing this work?** See [`perf-handoff.md`](perf-handoff.md) for the
 > prioritised plan, file map, build commands and known traps.
 
+> **Known correctness issue (not perf) — blocker, fix before T1–T7.**
+> Infinite GOP + lying feedback + `frame_index=0` error path (false ACK /
+> persistence of a bad frame). See `perf-handoff.md` for details. Pointer
+> refs: `client/decoder/android/android_decoder.cpp:224`,
+> `client/decoder/shard_accumulator.cpp:193`,
+> `server/encoder/idr_handler.cpp:49`, NVENC infinite GOP.
+
 ## Where the 50 ms actually goes
 
 `WIVRN_PIPELINE_STATS=1 wivrn-server` prints a per-stream breakdown averaged over
@@ -72,6 +79,26 @@ This is why the encoder is not the lever: a perfect NVENC would save ~2 ms out o
    rewriting the foveation shader to store into the NVENC buffer directly.
 4. **Display scheduling** (37 ms slack) is the largest term but lives in the
    headset compositor's present path, not in WiVRn.
+
+## Perf-hunt follow-ups (new leads, not yet measured)
+
+Highest expected value first. All need measurement before rewriting.
+
+| ID | Lead | Where | Expected | Note |
+|---|---|---|---|---|
+| N1 | Server foveation `pow()` per pixel | `server/compositor/shaders/foveation.comp:56-63` | 0.3-1.0 ms GPU | ~3.4M threads, ~10M `pow`/frame. Client already fixed the same with a polynomial (`client/shaders/reprojection.glsl:59`) but the server was not ported. Needs a Perfetto slice to confirm. May beat T1/T2. |
+| N2 | Video send: per-shard `writev`, not batched `sendmmsg` | `server/encoder/video_encoder.cpp:320-340` loop → `common/wivrn_sockets.cpp:355-380` | 0.1-0.4 ms CPU + airtime | ~100 syscalls/frame stereo. `send_many_raw` (`common/wivrn_sockets.cpp:385-441`) exists unused. Corrects the earlier T7 dismissal. |
+| N3 | Decoder job-thread hops | `client/decoder/android/android_decoder.cpp:254-275` (`queue_current`, `jobs.push`), `:557` (output release) | 0.1-0.3 ms off decode 4.2 ms | 2 `sync_queue` wakeups + `std::function` per frame per eye. |
+| N4 | Unconditional GPU timestamps | `client/scenes/stream.cpp:901,910,964,1160` | 0.05-0.2 ms | Gate on overlay. |
+| N5 | NVENC copy on compute queue + Monado mutex vs existing transfer queue | `server/encoder/video_encoder_nvenc.cpp:153-159,471`, `server/compositor/compositor.cpp:536`, `server/wivrn_vk_bundle.cpp:216` | unmeasured |  |
+| N6 | Foveation CPU on `xrEndFrame` thread | `server/compositor/foveation.cpp:449,492,285` | unmeasured |  |
+| N7 | Shared sender head-of-line blocking | `server/encoder/video_encoder.cpp:50-89` | unmeasured |  |
+| N8 | `serialized_size` per shard | `server/encoder/video_encoder.cpp:322` | unmeasured |  |
+
+Reassessment of T1–T7 in light of the hunt: T1 fence likely ~0 (37 ms
+slack); T2 may share a single NVENC engine (0-1.4 ms); T3 10 MB copy
+~0.02 ms pure; T6 is dead code for the wayvr single-projection path; the
+T7 `sendmmsg` dismissal was wrong (see N2).
 
 ## Benchmark
 
