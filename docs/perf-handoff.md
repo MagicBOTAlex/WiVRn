@@ -579,6 +579,41 @@ Still open, from the overnight audit:
    the game lives in a secondary Steam library — the icon lookup only checks
    the main library's `steam/games`.
 
+### T13 — Design: get the blocking TCP writes off the render thread
+
+This is the last multi-second stall in the client. Design agreed from the audit;
+implement only with the headset free.
+
+**Problem.** `client/scenes/stream.cpp:1281` (render thread) and
+`client/scenes/stream.cpp:680` (image-reader thread) call `send_control`, which
+is a blocking `sendmsg` with `SO_SNDTIMEO=5s` under a mutex shared with the
+tracking thread and the camera sender (`common/wivrn_sockets.cpp:570-600`). A
+congested control socket therefore freezes the render thread for up to 5 s,
+which is exactly the multi-second `blit` spike (and then the stall detector).
+
+**Design.**
+1. Add a per-session outbound queue of `from_headset::packets` plus a
+   dedicated `control_writer` thread. `send_control` becomes: serialise into the
+   queue, return. Never touches the socket from the render thread.
+2. Coalesce on enqueue: keep only the newest `feedback` per `stream_index`
+   (feedback is latest-wins; the pacer and the IDR handler only care about the
+   newest), and newest `foveation`. Never drop `session_state_changed`,
+   `start_app`, `get_application_list` or camera control packets.
+3. The writer drains the queue with `send_many_raw` (already exists,
+   `common/wivrn_sockets.cpp:583`) so one syscall carries a frame's feedback.
+4. Bound the queue: if it exceeds e.g. 256 KB or 32 packets, drop the oldest
+   coalescable entries and count them; a slow link must not grow memory.
+5. On a send error the writer sets the session's `net_exception` and stops;
+   the network thread then performs the normal teardown, so a dead socket is
+   detected in one place instead of from four threads.
+6. Keep `TCP::send_raw`'s partial-write poisoning (already added): the writer
+   is the only caller, so a poisoned connection is detected once.
+
+**Acceptance:** a `tc netem` stall (or `iptables -j DROP` on TCP) must not
+increase the render thread's frame time at all; the client shows a stall /
+reconnect instead of freezing. Measure with a scoped timer around the enqueue
+(p99 should be microseconds) and the existing `blit` column.
+
 ### T10 — Remaining measured items (small, low risk)
 
 - `client/scenes/stream.cpp:910-915`: `getResults(..., eWait)` is redundant
