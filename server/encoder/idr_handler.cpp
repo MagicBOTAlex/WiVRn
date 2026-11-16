@@ -40,7 +40,10 @@ void default_idr_handler::on_feedback(const from_headset::feedback & f)
 			                   }
 			                   else
 			                   {
-				                   U_LOG_W("IDR frame dropped, stream %d", f.stream_index);
+				                   U_LOG_W("IDR frame dropped, stream %d (retrying in 30 frames)", f.stream_index);
+				                   // Back off: immediately retrying under congestion makes
+				                   // it worse, because every keyframe is a burst.
+				                   next_idr_allowed = f.frame_index + 30;
 				                   state = need_idr{};
 			                   }
 		                   }
@@ -66,6 +69,7 @@ void default_idr_handler::reset()
 	std::unique_lock lock(mutex);
 	U_LOG_D("IDR handler reset");
 	state = need_idr{};
+	next_idr_allowed = 0;
 	non_ref_frames.assign(512, uint64_t(-1));
 }
 
@@ -83,6 +87,8 @@ bool default_idr_handler::should_skip(uint64_t frame_id, uint8_t stream_idx)
 		                              return true;
 	                              },
 	                              [this, frame_id](need_idr) {
+		                              if (frame_id < next_idr_allowed)
+			                              return true; // backing off after a lost keyframe
 		                              state = wait_idr_feedback{frame_id};
 		                              return false;
 	                              },

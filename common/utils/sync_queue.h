@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -83,6 +84,26 @@ public:
 		}
 
 		return {};
+	}
+
+	// Waits up to `timeout` for an item; nullopt on timeout. Used to apply
+	// backpressure to a producer when the consumer is temporarily saturated.
+	std::optional<T> pop_for(std::chrono::milliseconds timeout)
+	{
+		std::unique_lock lock(mutex);
+
+		if (not cv.wait_for(lock, timeout, [&]() { return !queue.empty() || closed; }))
+			return std::nullopt;
+
+		if (closed)
+			throw sync_queue_closed{};
+
+		if (queue.empty())
+			return std::nullopt;
+
+		T item = std::move(queue.front());
+		queue.pop_front();
+		return item;
 	}
 
 	// Non-blocking: returns nullopt instead of waiting for an item.

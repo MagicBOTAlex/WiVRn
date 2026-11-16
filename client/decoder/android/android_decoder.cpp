@@ -230,8 +230,12 @@ bool decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 
 	if (current_input_buffer.data == nullptr)
 	{
-		// Never block the receive thread on the decoder: drop the frame instead.
-		auto buffer = input_buffers.try_pop();
+		// Wait briefly for the decoder to return a buffer. Dropping the frame is
+		// far more expensive than a few ms of backpressure: the server has to
+		// send a keyframe, and a keyframe is the frame most likely to be lost
+		// again under load (a keyframe storm). If the wait times out the frame is
+		// dropped and reported, which is correct but should be rare.
+		auto buffer = input_buffers.pop_for(std::chrono::milliseconds(20));
 		if (not buffer)
 		{
 			dropped_frame = frame_index;

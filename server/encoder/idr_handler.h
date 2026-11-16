@@ -53,6 +53,10 @@ class default_idr_handler : public idr_handler
 		uint64_t last_ack;
 	};
 	std::variant<need_idr, wait_idr_feedback, running> state;
+	// Do not retry a keyframe before this frame index. A keyframe is the largest
+	// frame on the wire, so under load it is the most likely one to be lost;
+	// retrying on the very next frame turns that into a keyframe storm.
+	uint64_t next_idr_allowed = 0;
 	// NB: parentheses, not braces: {512, -1} is a two-element vector.
 	std::vector<uint64_t> non_ref_frames = std::vector<uint64_t>(512, uint64_t(-1));
 

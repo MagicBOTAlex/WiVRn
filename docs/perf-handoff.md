@@ -491,6 +491,45 @@ disconnected / no clock), `:320` (`acquire_image() < 0`), and the sender's
 frame skip. The pipeline stats exclude dropped frames, so the current numbers
 are survivorship-biased.
 
+### T11 — Load test: resolution ceiling and the keyframe storm
+
+Ran the stream at increasing encoder resolutions (wayvr/hello_xr, 90 Hz, AV1
+10-bit, Quest 3 over Wi-Fi 6). Encoder size is `resolution_scale * 2064` per
+eye, then `stream_scale` (default 0.5) and rounded to a multiple of 32.
+
+| Encoder size/eye | bitrate/eye | encode | decode | blit | total | verdict |
+|---|---|---|---|---|---|---|
+| 1280x1344 (default) | 24.6 Mbit/s | 2.0-3.5 | 3.1-3.7 | 4.7-5.6 | 28.6-30.1 ms | comfortable |
+| 2112x2176 | 59.2 Mbit/s | 3.4-5.1 | 6.0-6.5 | 4.5-6.8 | 36-39 ms | works at 90 Hz |
+| 2624x2752 | 46.9 Mbit/s | 4.9-7.5 | 6.4-6.6 | 7.4-16.5 | 41-48 ms | works, latency cost |
+| 3136x3264 | 88.8 Mbit/s | 6.0-9.5 | 8.9-12.7 | **100-420** | **154-480 ms** | collapses |
+
+`decode` stays ~6.5 ms up to 2624 wide, so the decoder is not the first wall:
+at 3136 the *bitrate* (88.8 Mbit/s/eye) is what breaks it, and the client falls
+hundreds of ms behind (`blit`), which is the "decoding errors under load"
+symptom.
+
+**Found under load: keyframe storm.** At 3136x3264 the server logged 11
+"IDR frame dropped" and 15 "IDR frame needed" in under a minute. Mechanism:
+
+- a slow decoder starves the MediaCodec input pool;
+- the branch's `try_pop` dropped the frame instead of applying backpressure;
+- a dropped frame makes the server send a keyframe, and a keyframe is the
+  largest frame on the wire, so it is the most likely one to be lost again;
+- the client drains all UDP before TCP, and keyframes go over TCP
+  (`prefer_control`), so a keyframe is routinely overtaken by newer P frames
+  and discarded as "old";
+- the IDR handler retried on the very next frame, so it never recovered.
+
+Fixed in `7d6a1f4`:
+
+- `sync_queue::pop_for()` and a 20 ms wait in `push_data`: a saturated decoder
+  now applies backpressure to the receive thread instead of dropping frames.
+- `default_idr_handler` backs off 30 frames (~0.33 s) after a lost keyframe, so
+  a lost keyframe cannot become a storm.
+
+Re-ran at the same 3136x3264 settings: **0 dropped keyframes** (was 11).
+
 ### T10 — Remaining measured items (small, low risk)
 
 - `client/scenes/stream.cpp:910-915`: `getResults(..., eWait)` is redundant
