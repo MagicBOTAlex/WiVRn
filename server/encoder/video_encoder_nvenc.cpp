@@ -324,6 +324,15 @@ video_encoder_nvenc::video_encoder_nvenc(
 			config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
 			config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = 0;
 			config.encodeCodecConfig.av1Config.idrPeriod = gop_frames;
+
+			// The client's sampler conversion is hardcoded to BT.709 full range
+			// (client/decoder/android/android_decoder.cpp), while H.264/H.265
+			// already set videoFullRangeFlag. AV1 used to leave these unset, so
+			// the decoder expanded studio-range data as if it were full range.
+			config.encodeCodecConfig.av1Config.colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+			config.encodeCodecConfig.av1Config.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+			config.encodeCodecConfig.av1Config.matrixCoefficients = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+			config.encodeCodecConfig.av1Config.colorRange = 1; // full swing
 			// set_intra_refresh(config.encodeCodecConfig.av1Config);
 
 			break;

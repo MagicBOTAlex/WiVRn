@@ -123,6 +123,21 @@ void pacer::predict(
 	};
 
 	out_present_slop_ns = slop_ns;
+
+	// The schedule is a p99.5-over-5000-frames controller, so a stage win does
+	// not move the median; these four numbers are what actually decide the
+	// latency. Opt-in, 1 Hz.
+	static const bool pacer_stats = getenv("WIVRN_PACER_STATS") != nullptr;
+	if (pacer_stats and frame_id % 90 == 0)
+	{
+		U_LOG_I("pacer: frame %ld lead %.1f ms (predicted_render-now), safe_present_to_decoded %.1f ms, wake_to_present %.1f ms, render_to_display %.1f ms, display_delay %.1f ms",
+		        long(frame_id),
+		        (predicted_client_render - now) / 1e6,
+		        safe_present_to_decoded_ns / 1e6,
+		        mean_wake_up_to_present_ns / 1e6,
+		        mean_render_to_display_ns / 1e6,
+		        (out_predicted_display_time_ns - out_desired_present_time_ns) / 1e6);
+	}
 }
 
 void pacer::on_feedback(const wivrn::from_headset::feedback & feedback, const clock_offset & offset)

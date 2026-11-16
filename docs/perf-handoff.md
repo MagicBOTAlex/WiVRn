@@ -1,13 +1,14 @@
 # Performance handoff — NVIDIA streaming path
 
-Status: work in progress, branch `perf/optimize` (HEAD `ee5922e9`).
+Status: T8 fixed in `c8af13eb` (needs a long soak to confirm), T2 done, T1/T3
+closed as ~0. Branch `perf/optimize`.
 Audience: whoever continues this. Read this before changing anything; several
 "obvious" optimizations were tried and reverted because they traded quality or
 dropped frames.
 
-> **Blocker — green screen every ~10 min (correctness, not perf).** Do not start
-> T1–T7 until T8 (§4) is fixed. See the new T8 section below; it is
-> prioritised above all perf items.
+> **T8 (green screen) is fixed in `c8af13eb`.** The section below keeps the
+> original analysis plus the corrections that came out of the deep re-audit —
+> read the corrections, several original claims were wrong.
 
 ---
 
@@ -44,6 +45,8 @@ Environment: RTX 4080 SUPER (driver 615), NixOS, Quest 3 at 90 Hz over Wi-Fi 6,
 | `b44c08e8` | actions synced after `xrWaitFrame`; shard-path allocation/lock removal; MediaCodec low-latency + `try_pop`; camera decode worker (out of scope but harmless); `-O3`; socket buffer; sRGB polynomial |
 | `236b189e` | **mostly reverted** — blit-target cap (resolution cut) and encoder frame-dropping |
 | `ee5922e9` | reverts the two above; adds compositor double-buffering and the pipeline breakdown |
+| `62d41508`, `53a3d7b9` | docs: green-screen analysis and perf-hunt follow-ups |
+| `c8af13eb` | T8 correctness fixes (bounded GOP, honest feedback, codec flush), T2 parallel encode, non-blocking UDP, bounded `wait_idle`, NVENC unmap, foveation/decoder hygiene, `fps_divider` clamp |
 
 ### What is deliberately reverted
 
@@ -112,7 +115,53 @@ grep 'pipeline: encode' .build/server-bench.log | tail
 start until the green-screen root cause in T8 is fixed and verified over
 >10 min without a decode error. T1–T7 are unchanged below.
 
-### T8 — Green screen every ~10 min (debugging) — critical correctness, do before perf
+### T8 — Green screen every ~10 min — FIXED in `c8af13eb`
+
+**Status: fixed and verified to build/run; long soak pending.** What landed:
+
+| Change | File |
+|---|---|
+| GOP bounded to 360 frames (4 s) instead of `NVENC_INFINITE_GOPLENGTH`; intra refresh removed (it is a no-op for AV1 and cannot coexist with a finite GOP) | `server/encoder/video_encoder_nvenc.cpp` |
+| `push_data` returns whether the frame was accepted; the shard accumulator only sets `sent_to_decoder` when it was | `client/decoder/decoder.h`, `android_decoder.cpp`, `shard_accumulator.cpp` |
+| A dropped frame is dropped whole (remaining shards discarded), never queued with a hole | `client/decoder/android/android_decoder.cpp` |
+| `on_media_error` sends the real `frame_index` and flushes the codec | `client/decoder/android/android_decoder.cpp` |
+| `non_ref_frames{512, -1}` (a 2-element vector) fixed | `server/encoder/idr_handler.h` |
+
+**Verified from the wire** (`WIVRN_DUMP_VIDEO` + `ffprobe`): before the fix,
+`dump-0.av1` had **1 KEY frame in 2510 frames**, zero `INTRA_ONLY`/`SWITCH`
+frames, `primary_ref_frame = 0` on every inter frame. Removing one frame makes
+libdav1d fail and never recover. After the fix, 8-12 KEY frames per ~3000
+frames, ~340 apart.
+
+**Corrections to the original analysis below (the deep re-audit overturned
+these):**
+
+- Cause #3 ("Quest AV1 SWITCH-frame handling") is **wrong**. NVENC emits no
+  refresh frames for AV1 at all; there is nothing for the decoder to
+  mishandle. Intra refresh is configured (100/50), the caps check passes, and
+  the driver silently ignores it.
+- "The server sees `sent_to_decoder != 0`, advances `last_ack`" is **wrong**:
+  `last_ack` advances only on `received_from_decoder`
+  (`server/encoder/idr_handler.cpp:57-58`). The real hole is that a concealing
+  decoder still reports `received_from_decoder`, so the `last_ack + 60` stale
+  check never fires. The server can detect *no output*, never *wrong output*.
+- A **single** dropped reference frame does **not** poison the stream forever:
+  AV1 rotates 8 DPB slots, so it heals in well under a second. Permanence
+  required *recurring* corruption — which is what the branch's `try_pop` path
+  produced, because it usually submitted a **head-truncated** frame (valid
+  timestamp, bitstream starting mid-frame) rather than skipping it cleanly.
+- `nvEncMapInputResource` without unmap and `frameIdx = 0` are real/non-issues
+  respectively, but **neither** is the green-screen cause. The map leak is
+  fixed anyway (unmap after the bitstream lock).
+- The ~600 s Wi-Fi `wpa_group_rekey` trigger is **unproven**: no code timer
+  exists, modern CCMP hostapd defaults to 86400 s, and this PC is wired
+  (`enp6s0` up, `wlp7s0` down) so a server-side EAPOL capture sees nothing.
+  Use Quest `wpa_supplicant` logs or an AP-side capture to confirm.
+- The stall detector (`client/scenes/stream.cpp:981`, drops to the lobby after
+  1 s without a blit) proves the decoder is **alive** during the green screen:
+  the corruption is in content/chroma, never "the codec stopped".
+
+**Original analysis (kept for context):**
 
 **Symptom:** decoding error every ~10 min; the screen goes everything green
 with only moving things updating (moving luma updates, static areas stay
@@ -242,7 +291,18 @@ same Wi‑Fi setup, correlated logs show an IDR following the first observed
 drop, and decoded `WIVRN_DUMP_VIDEO` output has no corrupt reference.
 Then (and only then) resume T1–T7.
 
-### T1 — Client blit pipelining (biggest controllable client term: 4–8 ms)
+### T1 — Client blit pipelining — CLOSED, expected gain ~0
+
+**Why closed:** `blit` is not GPU work. It is `blitted - received_from_decoder`,
+where `blitted` is stamped when the render thread picks the handle up
+(`client/scenes/stream.cpp:968,981`) and `received_from_decoder` is stamped on
+the ImageReader thread (`stream.cpp:667`). It is the phase wait for the render
+tick (0–11.1 ms sawtooth), not a fence stall: the defoveate pass is submitted a
+full display period before its fence is waited on. Double-buffering removes a
+wait that is already ~0. Reopen only if a 1 Hz timer on `waitForFences`
+(`stream.cpp:901`) shows >0.2 ms.
+
+**Original plan (kept for context):**
 
 **Where:** `client/scenes/stream.cpp:901` (`waitForFences` at the top of
 `render()`), one command buffer/fence/query pool in `client/scenes/stream.h`,
@@ -268,7 +328,19 @@ worse, `frames not sent` unchanged.
 
 ---
 
-### T2 — Encode both eyes concurrently (~1.4–2 ms)
+### T2 — Encode both eyes concurrently — DONE in `c8af13eb`
+
+Implemented as one worker per encoder with an epoch-ordered job queue
+(`server/compositor/compositor.cpp`, `compositor.h`). This also fixes the
+single `try/catch` that let one stream's exception starve the others (which
+hung `xrEndFrame` after two frames) and the `images[i].busy` leak on exception.
+
+Measured after: per-stream `encode` rises (the three sessions now contend for
+one NVENC engine) while the client-visible `total` dropped 32.4 → 30.8 ms.
+Still to measure: whether two sessions really overlap on this GPU (Perfetto is
+unavailable, `perfetto.h` missing from the flake).
+
+**Original plan (kept for context):**
 
 **Where:** `server/compositor/compositor.cpp:655` (`encoder_work`), the serial
 loop at `:670` calling `encoder->encode(...)`; `server/encoder/video_encoder.cpp:251`.
@@ -291,7 +363,16 @@ values should stay the same; the gap between the two streams' `encode_end` shrin
 
 ---
 
-### T3 — Remove the tiled→linear detile copy (0.5–1 ms)
+### T3 — Remove the tiled→linear detile copy — CLOSED, expected gain ~0
+
+**Why closed:** the copy moves 5.16 MB/eye (10.3 MB/frame read+write) on a
+4080 SUPER: 15–60 µs even pessimistically, and it is already inside the
+measured `encode` value because `encode()` waits on the copy fence. The
+"0.5–1 ms" estimate was an order of magnitude off on bandwidth. The
+`nvEncMapInputResource` leak in this path was fixed separately (unmap after the
+bitstream lock).
+
+**Original plan (kept for context):**
 
 **Where:** `server/encoder/video_encoder_nvenc.cpp:437` (`vkCmdCopyImageToBuffer`),
 `:550` (`nvEncMapInputResource` every frame, never unmapped), `:342` (the linear
@@ -343,14 +424,17 @@ test Touch, Touch Pro, and hand interaction.
 
 ---
 
-### T6 — Compositor hygiene (0.05–0.2 ms + fill for narrow-FOV apps)
+### T6 — Compositor hygiene — DONE in `c8af13eb`
 
-- `server/compositor/foveation.cpp:492-493`: the same 64 KB UBO is copied twice
-  (`vmaCopyMemoryToAllocation` then `memcpy`). Delete one.
-- `server/compositor/layer_squasher.cpp:570`: `fovs[view] = all_layers_fov` is
-  assigned *before* `w2/h2` are computed from it, so the viewport shrink ratio is
-  always 1.0 and the FOV-driven fill reduction never happens. Compute the ratio
-  first.
+- The duplicate 64 KB UBO copy is gone; `update_ubo` now snapshots under the
+  mutex and computes outside it (the network thread needs that mutex to deliver
+  eye-tracked angles), and `fill_param_2d` reuses two thread-local vectors
+  instead of allocating eight per frame.
+- `layer_squasher.cpp`: the reference FOV is measured before `fovs[view]` is
+  overwritten, so the crop ratio is no longer 1 by construction. Note this path
+  is dead for single-projection apps (they take the fast path in
+  `compositor.cpp:415-436`), so it only matters for multi-layer apps, and the
+  `min_size` clamp still limits how far the viewport can shrink.
 
 ---
 
@@ -364,6 +448,49 @@ test Touch, Touch Pro, and hand interaction.
   for v4-mapped peers. Add `IPV6_TCLASS` and do not throw on failure.
 
 Do not bother with encryption (6.7 µs/frame) or `sendmmsg` batching (2.4 µs/frame).
+
+**Partly done in `c8af13eb`:** UDP is now non-blocking (a full buffer drops
+datagrams instead of blocking the sender), the send buffer is 64 KB instead of
+512 KB, `wait_idle` is bounded at 500 ms and drops the frame, the sender pops
+its queue unconditionally, and `set_tos` also sets `IPV6_TCLASS`.
+
+---
+
+### T9 — Measure the pacer, not the stages (do this before any further tuning)
+
+`total` is not a sum of work: it is `displayed - encode_begin`, and `displayed`
+is a vsync slot chosen by `pacer::predict` (`server/compositor/pacer.cpp:96-126`).
+The schedule moves in whole display periods (11.1 ms at 90 Hz), and
+`safe_present_to_decoded_ns` is the **p99.5 over the last 5000 frames (~55 s)**
+(`pacer.cpp:47-71`). So a 300 ms network stall pins the schedule one frame
+later for the next minute — a sustained +11.1 ms.
+
+Consequence: making a stage faster in the median moves nothing. Only tail
+reduction (or not dropping frames) can step the schedule earlier.
+
+**Do:** log at 1 Hz from `pacer::predict`: `predicted_client_render - now`,
+`safe_present_to_decoded_ns`, `mean_wake_up_to_present_ns`,
+`mean_render_to_display_ns`. Those four numbers explain the whole latency
+figure and make every other measurement interpretable.
+
+Also add counters for the silent drops: `compositor.cpp:313` (encoder busy /
+disconnected / no clock), `:320` (`acquire_image() < 0`), and the sender's
+frame skip. The pipeline stats exclude dropped frames, so the current numbers
+are survivorship-biased.
+
+### T10 — Remaining measured items (small, low risk)
+
+- `client/scenes/stream.cpp:910-915`: `getResults(..., eWait)` is redundant
+  (the fence at `:901` already covers the command buffer) and the timestamp
+  block runs even with the stats overlay closed. Gate it on overlay visibility.
+  10–40 µs.
+- `server/compositor/shaders/foveation.comp:56-63`: `pow()` per pixel
+  (~10 M/frame). Measured cost ~11 µs, so this is not worth a quality risk —
+  skip unless the shader is being touched anyway.
+- `client/scenes/stream.cpp:1269-1273`: the client sends foveation angles every
+  frame, so the server's `update_ubo` never early-outs. Quantising the angles
+  would make the fast path hit; the server-side cost is now ~40 µs (computed
+  outside the mutex, no duplicate copy).
 
 ---
 

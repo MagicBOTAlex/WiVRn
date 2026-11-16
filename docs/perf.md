@@ -6,12 +6,15 @@ path. Camera passthrough is out of scope.
 > **Continuing this work?** See [`perf-handoff.md`](perf-handoff.md) for the
 > prioritised plan, file map, build commands and known traps.
 
-> **Known correctness issue (not perf) — blocker, fix before T1–T7.**
-> Infinite GOP + lying feedback + `frame_index=0` error path (false ACK /
-> persistence of a bad frame). See `perf-handoff.md` for details. Pointer
-> refs: `client/decoder/android/android_decoder.cpp:224`,
-> `client/decoder/shard_accumulator.cpp:193`,
-> `server/encoder/idr_handler.cpp:49`, NVENC infinite GOP.
+> **Green screen every ~10 min — fixed in `c8af13eb`.** Root cause verified
+> from the encoded bitstream: infinite GOP (one KEY frame in 2510 frames) and
+> NVENC emitting no intra-refresh frames at all for AV1, so a single lost
+> reference frame could never be repaired; the client then concealed with
+> zeroed chroma (Y=U=V=0 → green) while moving blocks got fresh residuals.
+> The client also claimed every complete frame had reached the decoder, so the
+> server never asked for a keyframe. Fixes: 4 s GOP, honest `push_data`
+> result, whole-frame drops (never a bitstream with a hole), real frame index
+> and a codec flush on MediaCodec errors. Details in `perf-handoff.md` T8.
 
 ## Where the 50 ms actually goes
 
