@@ -593,10 +593,26 @@ Still open, from the overnight audit:
    the game lives in a secondary Steam library — the icon lookup only checks
    the main library's `steam/games`.
 
-### T13 — Design: get the blocking TCP writes off the render thread
+### T13 — Blocking TCP writes moved off the render thread — SHIPPED `9f59875e`
 
-This is the last multi-second stall in the client. Design agreed from the audit;
-implement only with the headset free.
+Shipped blind (headset blocked by a guardian dialog) and **needs validation
+tomorrow**. `send_control` now enqueues the typed packet; a dedicated writer
+thread serialises and sends it, coalescing feedback per stream and foveation
+latest-wins, bounded at 64 packets. A send failure marks the connection failed
+and the poll loop turns it into the normal teardown. The handshake still writes
+synchronously. Also: control keyframes are chunked at 64 KB instead of one
+~1 MB message, so the sender is never blocked for the whole transmission.
+
+**Validate first:** start a session, then `iptables -I OUTPUT -p tcp --dport
+9757 -j DROP` for 3 s and remove it. Before this change the render thread froze
+for up to 5 s (`blit` in the thousands); now the client should stall/reconnect
+without a freeze. Check the pipeline `blit` column stays in single digits, and
+that feedback still reaches the server (keyframes are still requested on loss).
+
+If it regresses: `git revert 9f59875e` restores the direct sends; nothing else
+depends on it.
+
+**Original design note (kept for context):**
 
 **Problem.** `client/scenes/stream.cpp:1281` (render thread) and
 `client/scenes/stream.cpp:680` (image-reader thread) call `send_control`, which

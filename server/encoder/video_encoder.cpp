@@ -327,7 +327,15 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 	if (video_dump)
 		video_dump.write((char *)data.data(), data.size());
 
-	ssize_t max_payload_size = (cnx->has_stream() and not control) ? to_headset::video_stream_data_shard::max_payload_size : std::numeric_limits<uint32_t>::max();
+	// Keyframes go over TCP, where there is no MTU limit, but sending a ~1 MB
+	// keyframe as one message blocks the sender thread for its whole
+	// transmission (~160 ms at 50 Mbit/s) and leaves the bitstream locked.
+	// 64 KB chunks keep every write short; the client's shard accumulator
+	// reassembles them exactly like UDP shards.
+	constexpr ssize_t control_payload_size = 64 * 1024;
+	ssize_t max_payload_size = (cnx->has_stream() and not control)
+	        ? to_headset::video_stream_data_shard::max_payload_size
+	        : control_payload_size;
 
 	auto begin = data.begin();
 	auto end = data.end();
