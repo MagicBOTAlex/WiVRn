@@ -679,6 +679,34 @@ reconnect instead of freezing. Measure with a scoped timer around the enqueue
 - Remaining to check by hand: controller inputs in a game (action filter), and
   the launcher tiles/names/icons.
 
+## 4d. A/B against a stock WiVRn build (11acda8a)
+
+Same workload (hello_xr, 90 Hz, 1280x1344/eye, 50 Mbit/s), same headset, one
+server, sampled over 60 s each. The stock build is the fork point built the way
+the flake builds it; the pipeline breakdown is one of the additions, so only CPU
+and the client's own motion-to-photon readout are comparable.
+
+| | server CPU | headset CPU | motion to photons |
+|---|---|---|---|
+| stock `11acda8a` | 8.0 % | 41.0 % | **43 ms** |
+| `perf/optimize` (before revert) | 8.5 % | 41.6 % | **50 ms** |
+| `perf/optimize` (after pacer revert) | — | — | **42 ms** |
+
+Conclusions:
+
+- **Throughput is a wash.** The pipeline was never CPU-bound; the changes buy
+  robustness and tail behaviour, not throughput. Expect no CPU saving.
+- **The pacer de-ratchet was a regression** and is reverted (`bf6ca6ec`):
+  three samples at 50 ms against three at 42-43 ms, reproduced across restarts.
+  Keeping `WIVRN_PACER_STATS` for future work.
+- After the revert the branch is at parity on latency (42 vs 43 ms) and much
+  better on failure modes: no permanent green screen, no keyframe storm under
+  load, no multi-second render-thread freeze.
+- Stock build notes for whoever repeats this: it crashes at startup with
+  `directory iterator cannot open directory /usr/local/share/openxr/1` unless
+  started with `--no-manage-active-runtime`, and it cannot print the pipeline
+  breakdown at all.
+
 ## 4c. The `blit` "tail" is an idle artifact, not a stall
 
 Clean 6-minute run while the headset was active: `blit` p50 4.6 ms, p99 7.6 ms,
