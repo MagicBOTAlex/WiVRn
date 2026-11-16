@@ -660,6 +660,37 @@ reconnect instead of freezing. Measure with a scoped timer around the enqueue
 
 ---
 
+## 4b. Test plan for the blind-shipped changes
+
+Everything from `9f59875e` and `f64b5b5f` was written without a headset run (a
+guardian dialog was blocking app launches). Validate in this order; each step
+has a one-command revert.
+
+1. **Smoke (2 min).** `tools/bench/preflight.sh` then
+   `tools/stream-test.sh --app "steam -applaunch 620980" --seconds 60`.
+   Expect: frames flow, `total` ~30 ms, 0 network exceptions, 0 decoder drops.
+   If the stream never starts: `git revert 9f59875e f64b5b5f` (the queued writer
+   and the 64 KB keyframe chunks are the only two transport changes).
+2. **Control-socket stall.** While streaming, `sudo iptables -I OUTPUT -p tcp
+   --dport 9757 -j DROP`, wait 3 s, delete the rule. Before T13 the render
+   thread froze up to 5 s; now `blit` should stay in single digits and the
+   client should recover or reconnect. If it freezes, revert `9f59875e`.
+3. **Keyframe path.** Watch for `IDR frame needed` / `IDR frame dropped` for a
+   minute. Chunked keyframes must still be reassembled (the client logs
+   `Mediacodec error` / `no input buffer` if not). If keyframes stop working,
+   revert `f64b5b5f` only.
+4. **App launcher.** Open the Applications tab: every installed app should have
+   its name and icon (the id-fallback and icon-cache fixes). Beat Saber must be
+   listed (it was missing after the first library-filter attempt).
+5. **Pacer.** With `WIVRN_PACER_STATS=1`, `lead` should be stable and the new
+   `deficit` field should be ~0 in steady state; no `pacer: schedule ... behind`
+   warnings during normal play.
+6. **Inputs.** In Beat Saber, verify both controllers, trigger, grip, thumbstick
+   and the menu button. The action filter queries only active actions; if an
+   input dies, watch the debug log line `Input actions: N total, M queried,
+   K active` and revert `28e93d57` if `M` collapses to a subset that excludes
+   an input you are using.
+
 ## 5. Measurement protocol
 
 - Workload: `VRBENCH_APP=wayvr tools/bench.sh <label> <seconds>`.
