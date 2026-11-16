@@ -544,12 +544,18 @@ first.
 Two OpenXR apps cannot share the session: whichever connects last owns it and
 the other idles, which silently invalidates a measurement.
 
-### T12 — Session robustness (partly done in `3733263a`)
+### T12 — Session robustness (mostly done)
 
-Fixed: single-instance lock (a second server unlinked the first's IPC socket),
-active runtime registered for the server lifetime, TCP poisoned after a partial
-write, dropped UDP datagram → immediate keyframe request, UDP send buffer
-192 KB, 30 s stall threshold.
+Fixed across `3733263a`, `28e93d57`, `0b74596e`, `0f131477`, `bc57f9e3`:
+single-instance lock; active runtime registered for the server lifetime; TCP
+poisoned after a partial write; dropped UDP datagram → immediate keyframe
+request; UDP send buffer 192 KB; TCP keepalive; EINTR handling; `send_many_raw`
+returns what it queued instead of throwing; unknown interaction profile and
+missing body tracker no longer pause the session or crash the server;
+`pause_session` guarded so a secondary failure cannot terminate the process;
+camera frames dropped above a 96 KB control backlog; `set_state` retries;
+image-reader thread can no longer block forever; app list falls back to the id
+for an empty name and the launcher keeps icons that arrive early.
 
 Still open, from the overnight audit:
 
@@ -557,8 +563,8 @@ Still open, from the overnight audit:
    (`client/scenes/stream.cpp:1281`, `common/wivrn_sockets.cpp:570-600`): the
    TCP socket is blocking and its mutex is shared with the image-reader,
    tracking and camera threads. This is the actual source of multi-second
-   `blit` spikes, not the GPU. Fix: non-blocking control socket plus a
-   coalescing sender thread (keep newest feedback per stream).
+   `blit` spikes, not the GPU. Design is written up as **T13** below; it needs
+   the headset to validate, so it was not landed blind.
 2. **Keyframes are one unsharded ~1 MB TCP message** (`video_encoder.cpp:330`).
    It blocks the single sender thread for its whole transmission, and the
    following P-frames overtake it over UDP. Fix: shard to 8-16 KB and gate the
@@ -572,8 +578,16 @@ Still open, from the overnight audit:
    plus a missed-frame counter, and de-ratchet the bump.
 5. **Client `set_state`** is a single `compare_exchange_strong` without a retry
    loop; a race with `push_blit_handle` can leave the scene state inconsistent.
-6. **Action polling** queries ~120 actions when ~25 are bound (0.2-0.5 ms);
-   filter by the active interaction profile and re-scan on profile change.
+6. ~~Action polling~~ **done** (`28e93d57`): only active actions are queried,
+   with a re-scan on profile change and every 300 frames.
+7. **Client GPU timestamps** (`client/scenes/stream.cpp:910`) read the query
+   pool with `eWait` and write timestamps every frame even when the statistics
+   overlay is closed. Drop `eWait` (the fence above already covers it) and gate
+   the whole block on overlay visibility.
+8. **Refresh-rate adjuster** (`server/driver/wivrn_session.cpp:1260`) computes
+   the app rate from `max(cpu, gpu)` while `app_pacer` budgets
+   `cpu + gpu + compositor_time`, so it can request a refresh rate the pipeline
+   cannot sustain.
 7. **App list**: the server-side list is correct (`common/list-apps` prints
    wayvr, Beat Saber, VRChat), but a tile can render without its name/icon when
    the game lives in a secondary Steam library — the icon lookup only checks
