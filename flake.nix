@@ -82,6 +82,11 @@
                 cmakeFlags = (lib.filter (flag: !lib.hasInfix "GIT_" flag) oldAttrs.cmakeFlags) ++ [
                   (lib.cmakeFeature "GIT_DESC" "nightly")
                   (lib.cmakeFeature "GIT_COMMIT" "nightly")
+                  # nixpkgs ships WiVRn VAAPI-only, which cannot encode on NVIDIA
+                  # at all. Enable NVENC and drop VAAPI so the packaged server and
+                  # the AppImage built from it work on an NVIDIA host.
+                  (lib.cmakeBool "WIVRN_USE_NVENC" true)
+                  (lib.cmakeBool "WIVRN_USE_VAAPI" false)
                 ];
               }
             );

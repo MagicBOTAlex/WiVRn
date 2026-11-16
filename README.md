@@ -1,361 +1,117 @@
-<h1 align="center">WiVRn &mdash; USB camera passthrough fork</h1>
+# WiVRn — camera passthrough fork
 
-<p align="center"><img src="images/wivrn.svg" width="140"></p>
+A fork of [WiVRn](https://github.com/WiVRn/WiVRn) with USB camera passthrough from
+the headset to the PC, plus a long pass over streaming correctness and latency.
 
-This is a fork of [WiVRn](https://github.com/WiVRn/WiVRn) that adds **USB (UVC)
-camera passthrough from the headset to the PC**.
+**Camera passthrough is kept and works**: up to three USB cameras on the headset
+are streamed to the PC as `/dev/videoN` devices, with stable identity → device
+mapping and no root required.
 
-Plug a webcam into a Meta Quest 3, and it shows up on the Linux PC as
-`/dev/video10` (or 11, 12, ...) through
-[v4l2loopback](https://github.com/v4l2loopback/v4l2loopback). Any application that
-can use a webcam (OBS, Firefox, Chrome, Zoom, Discord, ...) sees it, over Wi-Fi,
-while the headset is streaming.
+## Attempted
 
-No root, no custom kernel, no Camera2: the headset has no `uvcvideo` driver, so
-the cameras are driven from userspace with libusb.
+- Capped the client blit target at the panel resolution — reverted, it was a resolution cut, not an optimisation.
+- Dropped encoder frames when the sender was busy — reverted, it lost frames and could stall the IDR state machine for ~1.1 s.
+- Used three encoder slots — reverted, the compositor only owns two images.
+- Sent MediaCodec partial frames — reverted, the threshold split every frame and abandoned partials could corrupt the next one.
+- Gated camera writes on `POLLOUT` — reverted, v4l2loopback always reports writable, so it was a no-op syscall.
+- De-ratcheted the pacer's schedule bump — reverted, measured 8 ms worse (50 ms vs 42 ms).
+- Skipped `start_frame` for scenes without a world — reverted, the GUI draws on an empty registry.
+- Hid apps from unmounted Steam libraries — reverted, it hid installed games; now keyed on the appmanifest instead.
+- Shrank the ImageReader pool — reverted, it risked the input starvation that was just fixed.
+- Replaced the server's sRGB `pow()` with a polynomial — skipped, measured at ~11 µs per frame.
+- Double-buffered the client blit — skipped, `blit` is a phase wait for the vsync, not GPU work.
+- Removed the tiled→linear detile copy — skipped, 10 MB per frame is 15–60 µs and already inside `encode`.
+- Turned NVENC multipass off / used the P1 preset — not done, it is a quality-per-bit trade.
+- Streamed at 4–8K per eye — tested and rejected, `resolution_scale` also scales the client's blit target, so it collapses.
 
-Everything upstream still works; this fork only adds the camera feature (plus a
-small amount of plumbing in the WiVRn protocol and settings UI).
+## Kept
 
----
+- Bounded the GOP to 4 s instead of infinite, so a lost reference heals by itself.
+- Made `push_data` report whether the frame reached the decoder.
+- Dropped frames whole instead of queueing a bitstream with a hole.
+- Sent the real frame index, and flushed the codec, on MediaCodec errors.
+- Backed off 30 frames after a lost keyframe, so a keyframe cannot become a storm.
+- Applied 20 ms of backpressure instead of instantly dropping when the decoder is saturated.
+- Encoded the streams on one worker each instead of serially.
+- Released `images[i].busy` with a scope guard, so one exception cannot kill the stream.
+- Made the UDP send non-blocking with a 192 KB buffer.
+- Bounded `wait_idle` and popped the sender queue unconditionally.
+- Moved client control traffic to its own writer thread.
+- Chunked control keyframes at 64 KB instead of one ~1 MB write.
+- Dropped camera frames when the control socket backs up.
+- Unmapped the NVENC input after the bitstream lock.
+- Computed foveation outside the mutex and removed the duplicate 64 KB copy.
+- Checked the hardware-buffer cache before the per-frame properties query.
+- Queried only active input actions.
+- Added TCP keepalive, EINTR handling and partial-write poisoning.
+- Took a single-instance lock so two servers cannot fight over the IPC socket.
+- Kept the OpenXR runtime registered for the server's lifetime.
+- Let a client that fell back to the app list re-enter the stream.
+- Raised the stall threshold from 3 s to 30 s so a loading screen cannot eject you.
+- Fixed the launcher's app names and icon cache.
+- Clamped the client-supplied `fps_divider`.
+- Declared the AV1 colour range as BT.709 full, matching the client.
+- Built with `-O3` (the nixpkgs package used `-Og`).
+- Added benchmark tooling and opt-in instrumentation.
 
-## What it looks like
+## Details
 
-`Settings -> Cameras` in the in-stream WiVRn menu: each physical camera keeps a
-fixed `/dev/videoN`, matched by USB serial, and the mapping is persisted.
+### Camera passthrough
 
-![Cameras settings tab](docs/camera-settings.png)
+The headset's UVC cameras are captured as MJPEG, sent to the PC, decoded once
+with libavcodec and converted to I420 into v4l2loopback nodes. Identity is the
+USB serial, so the mapping survives replugs and enumeration order changes. No
+root is needed: the app holds the USB permission and hands the usbfs fd to
+libusb. Up to three cameras are supported; a camera the link cannot carry is
+dropped at frame granularity, never degraded.
 
-Two cameras streaming into `/dev/video10` and `/dev/video11` at the same time:
+### The green screen
 
-```console
-$ ffprobe -v error -f v4l2 -i /dev/video10 -show_entries stream=width,height -of csv=p=0
-1280,720
-$ ffprobe -v error -f v4l2 -i /dev/video11 -show_entries stream=width,height -of csv=p=0
-1280,720
-```
+The original bug was a stream that turned green after roughly ten minutes and
+never recovered. Verified from the encoded bitstream: the AV1 stream had one
+KEY frame in 2510 frames and NVENC emitted no intra-refresh frames at all, so
+nothing could ever repair a lost reference. The client made it permanent by
+reporting every complete frame as delivered even when the decoder had silently
+dropped or truncated it.
 
-Server log while both are running:
+The fix is a bounded GOP plus honest feedback: `push_data` returns whether the
+frame was accepted, dropped frames are dropped whole, and MediaCodec errors
+carry the real frame index and flush the codec. A lost frame now costs a short
+glitch instead of a restart.
 
-```console
-INFO [load_camera_config] Loaded 2 camera assignment(s) from cameras.json
-INFO [update_cameras] Camera 200901010001 (right eye) -> /dev/video11
-INFO [update_cameras] Camera A007240223000154 (left eye) -> /dev/video10
-INFO [send_camera_stream_description] Streaming 2 camera(s) from the headset
-INFO [configure] Camera 0: streaming 1280x720 I420 (stride 1280) to /dev/video11
-INFO [configure] Camera 1: streaming 1280x720 I420 (stride 1280) to /dev/video10
-```
+### The keyframe storm
 
----
+At high resolution the stream could enter a loop where every keyframe was lost,
+each loss requested another, and none arrived. Fixed with decoder backpressure
+(a saturated decoder throttles the receive thread instead of dropping) and a
+30-frame backoff after a lost keyframe. At 3136×3264 the count went from 11
+dropped keyframes to 0.
 
-## Pipeline
+### Latency work
 
-![Pipeline](docs/camera-pipeline.png)
+Measured against a stock build on the same workload: server CPU 8.5 % vs 8.0 %,
+headset CPU 41.6 % vs 41.0 %, motion-to-photon 42 ms vs 43 ms. Throughput is a
+wash because the pipeline is display-scheduling-bound: of ~27 ms, ~15.6 ms is
+the frame waiting for its vsync slot and only ~11 ms is work (encode 2,
+network 1.8, decode 3.8, blit 3.4). The wins are in failure modes, not speed.
 
-```
-USB camera (MJPEG)
-  -> Quest 3: userspace UVC over libusb (UsbManager fd, no root)
-  -> WiVRn control socket over Wi-Fi (MJPEG frames, encrypted like every packet)
-  -> wivrn-server: libavcodec MJPEG -> I420, full range -> limited range
-  -> v4l2loopback /dev/video10..17
-  -> OBS / browser / Zoom / anything
-```
+### Instrumentation
 
-### Why userspace UVC?
+- `WIVRN_PIPELINE_STATS=1` — per-stream encode/network/decode/blit/display/total.
+- `WIVRN_PACER_STATS=1` — the pacer's controller inputs.
+- `WIVRN_FEEDBACK_CSV=path` — one line per frame with every timestamp.
+- `WIVRN_STALL_STATS=1` / `adb shell setprop debug.wivrn.stall_stats 1` — logs any render-thread call over 20 ms.
+- `tools/stream-test.sh` — one clean session with local-only sampling.
+- `tools/bench/collect.py` — log to CSV plus percentiles.
 
-| Attempt | Result |
-|---|---|
-| Camera2 API | Only exposes Quest *virtual* cameras; the UVC cameras are invisible |
-| Kernel `uvcvideo` | `CONFIG_MEDIA_USB_SUPPORT` is not set in the Quest kernel, and there is no root to change it |
-| PipeWire `Video/Source` on the PC | Crashed inside PipeWire's own `videoconvert` during negotiation |
-| **libusb over the UsbManager fd** | **Works**, no root, no kernel changes |
-
-The camera stream is MJPEG all the way through: it is never decoded on the
-headset and never re-encoded, so the CPU cost on the Quest is just USB reads and
-a memcpy.
-
----
-
-## Requirements
-
-**Headset**
-
-- Meta Quest 3 (Horizon OS / Android 14). Other Android headsets may work; the
-  USB permission names below are Meta-specific.
-- `android.permission.CAMERA` and `horizonos.permission.USB_CAMERA`.
-  Both are declared by the app; grant them with `adb shell pm grant` (see below).
-  Without the second one, `UsbManager.requestPermission()` is denied with no
-  dialog for any UVC device.
-- A UVC camera that exposes **MJPEG**. YUYV-only cameras are rejected (see
-  [Limitations](#limitations)).
-
-**PC**
-
-- Linux with `v4l2loopback`.
-- `libavcodec`/`libavutil` (the server links them for MJPEG decode).
-- WiVRn's usual dependencies.
-
-### v4l2loopback setup
-
-The sink uses `/dev/video10` .. `/dev/video17`. Load the module with enough
-devices for the number of cameras you have, and `exclusive_caps=1` **per device**
-(otherwise only the first node accepts readers):
-
-```nix
-# NixOS: /etc/nixos/modules/obs.nix (or wherever you configure kernel modules)
-boot.extraModprobeConfig = ''
-  options v4l2loopback exclusive_caps=1,1,1,1,1,1,1,1 video_nr=10,11,12 card_label="WiVRn camera 0,WiVRn camera 1,WiVRn camera 2"
-'';
-```
-
-On a non-NixOS distribution the equivalent is
-`/etc/modprobe.d/v4l2loopback.conf` with the same `options` line.
-
-`card_label` is only the default name; once a camera is assigned, the label comes
-from `cameras.json` (e.g. "left eye").
-
----
-
-## Building
-
-### Server
+### Building
 
 ```bash
-cd WiVRn
-nix develop --command bash -c 'cmake -B build-server . -GNinja \
-  -DWIVRN_BUILD_CLIENT=OFF -DWIVRN_BUILD_DASHBOARD=OFF'
-nix develop --command bash -c 'cmake --build build-server -j$(nproc)'
-```
-
-The camera sink needs `libavcodec` regardless of which video encoder is selected,
-so `WIVRN_USE_VAAPI=OFF` (NVENC-only builds) works too.
-
-### Headset APK
-
-On NixOS the Android SDK/NDK come from `android-nixpkgs`; see
-[`building.md`](docs/building.md) for the general toolchain notes. For this
-environment the wrapper is `.build/shell.nix` in the parent directory:
-
-```bash
-cd WiVRn
+# server
+nix build .            # NVENC enabled, VAAPI disabled
+# headset
 nix-shell ../.build/shell.nix --run './gradlew --no-daemon assembleDebug'
-adb install -r build/outputs/apk/debug/WiVRn-debug.apk
-adb shell pm grant org.meumeu.wivrn.local android.permission.CAMERA
-adb shell pm grant org.meumeu.wivrn.local horizonos.permission.USB_CAMERA
 ```
 
-libusb is built from source and statically linked into the APK; its licence is
-copied into the app's licence directory like the other third-party libraries.
-
----
-
-## Running
-
-Start the server:
-
-```bash
-cd WiVRn
-nix develop --command bash -c \
-  'export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH; ./build-server/server/wivrn-server'
-```
-
-Connect the headset. First time, enable pairing from the PC and put the PIN in
-the URI:
-
-```bash
-gdbus call --session --dest io.github.wivrn.Server --object-path /io/github/wivrn/Server \
-  --method io.github.wivrn.Server.EnablePairing 300
-adb shell am start -a android.intent.action.VIEW \
-  -d "wivrn://:PIN@192.168.50.58:9757" \
-  -n org.meumeu.wivrn.local/org.meumeu.wivrn.MainActivity
-```
-
-Afterwards:
-
-```bash
-adb shell am start -a android.intent.action.VIEW \
-  -d "wivrn://192.168.50.58:9757" \
-  -n org.meumeu.wivrn.local/org.meumeu.wivrn.MainActivity
-```
-
-Check the cameras on the PC:
-
-```bash
-ffmpeg -f v4l2 -i /dev/video10 -frames:v 1 out.jpg
-```
-
-### First plug-in
-
-The app declares a `USB_DEVICE_ATTACHED` intent filter with
-`res/xml/device_filter.xml`, so Android grants USB access automatically for the
-known cameras. For an unknown camera, one "Allow" (choose **Always**) is needed
-the first time; after that a replug does not prompt.
-
-If access is denied, the camera is simply not advertised to the PC (the app does
-not re-open a permission dialog every two seconds).
-
----
-
-## Camera assignment
-
-A camera is identified by its **USB serial number**, falling back to `vid:pid`
-(and to `vid:pid@bus-path` if two cameras report the same serial). The mapping is
-stored in:
-
-```
-$XDG_CONFIG_HOME/wivrn/cameras.json    (or ~/.config/wivrn/cameras.json)
-```
-
-```json
-{
-  "cameras": [
-    { "identity": "A007240223000154", "device": 10, "label": "left eye" },
-    { "identity": "200901010001",     "device": 11, "label": "right eye" }
-  ]
-}
-```
-
-- Unlisted cameras get the first free loopback device.
-- The label becomes the v4l2 card name, which is what applications display.
-- The file is written atomically (temp file + rename), so a crash cannot lose it.
-- Device numbers are validated against 10..17 and must be v4l2loopback output
-  devices.
-
-### Changing it from the headset
-
-`Settings -> Cameras` lists every attached camera with a segmented picker for
-`/dev/video10` .. `/dev/video17`. Picking a device sends a `set_camera_device`
-packet; the server builds the new node, swaps it in, persists `cameras.json`, and
-replies with the new assignment. If the move fails, the old node keeps running.
-
-### Changing it from the PC
-
-There is no dashboard page yet. Edit `cameras.json` and restart the server, or
-use the debug hook described below.
-
----
-
-## Hotplug and reconnects
-
-- The headset scans the USB topology every 2 s on the network thread (not the
-  render thread, which stops when the headset is idle).
-- Unplugging a camera stops its capture and tells the server, which removes the
-  v4l2 node and re-sends the description.
-- Re-plugging recovers in a few seconds, on the same `/dev/videoN`, with no user
-  interaction.
-- A capture that stops delivering for 3 s is treated as dead and restarted; a
-  camera that starts but never delivers backs off by 3 s instead of being torn
-  down on every scan.
-- A camera plugged in while the headset was disconnected is picked up on the next
-  session: the client sends its camera list once at the start of each session.
-
----
-
-## Debugging
-
-| Variable / property | Effect |
-|---|---|
-| `WIVRN_CAMERA_DUMP=/tmp/dump` (server) | Write the raw MJPEG of each camera to `/tmp/dump-<id>.mjpg` instead of v4l2loopback. Each file is a concatenation of JPEG images. |
-| `WIVRN_CAMERA_MOVE=<identity>:<device>` (server) | Apply one assignment at startup, e.g. `WIVRN_CAMERA_MOVE=A007240223000154:12`. It goes through the same code path as the settings UI and persists the result. |
-| `adb shell setprop debug.wivrn.ui cameras` | **Debug builds only.** Open that settings page on start (`video`, `audio`, `streaming`, `post_processing`, `devices`, `cameras`, `tracking`, `theme`, `system`). Applied once; clear it with `adb shell setprop debug.wivrn.ui '""'`. |
-
-### Colour
-
-MJPEG decodes to full-range YUV (`yuvj420p`/`yuvj422p`, sometimes 4:4:4). YUV420
-consumers assume **limited** range unless told otherwise, and several ignore the
-v4l2 quantization tag, so the sink converts full -> limited once and tags the
-buffer as limited BT.601. Verified by comparing the RGB means of the camera's own
-JPEG with a frame read from the v4l2 node (both `18.0` on the same static scene).
-
-Chroma is subsampled correctly for 4:2:0, 4:2:2 and 4:4:4 sources.
-
----
-
-## How it is implemented
-
-### Protocol (`common/wivrn_packets.h`)
-
-| Direction | Packet | Purpose |
-|---|---|---|
-| headset -> PC | `camera_frame` | One complete MJPEG image (`camera_id`, `frame_idx`, timestamp, payload) |
-| headset -> PC | `camera_list` | Attached cameras (id, identity, name), sent on connect and on hotplug |
-| headset -> PC | `set_camera_device` | Move an identity to another `/dev/videoN` |
-| PC -> headset | `camera_stream_description` | Cameras to capture (empty list = stop all) |
-| PC -> headset | `camera_assignment` | Current identity -> device + label, for the settings page |
-| both | `headset_info_packet::cameras` | Cameras advertised at connection time |
-
-The protocol hash covers every field, so a mixed old/new pair fails the handshake
-with "Incompatible server version" rather than misbehaving.
-
-### Client
-
-| File | Role |
-|---|---|
-| `client/java/UsbCamera.java` | UsbManager enumeration, permissions, `openUsb(identity)` -> usbfs fd. Keyed by identity, one receiver for the process, only video interfaces claimed. |
-| `client/android/uvc.{h,cpp}` | Userspace UVC: descriptor parsing, `VS_PROBE`/`VS_COMMIT`, iso + bulk transfers, MJPEG frame reassembly. |
-| `client/android/camera.{h,cpp}` | JNI bridge (class loaded through the activity's class loader) and the frame queue. |
-| `client/scenes/stream_network.cpp` | Camera list/description handling, capture ownership by identity, a dedicated sender thread with a 2-frame drop-oldest queue. |
-| `client/scenes/gui_settings.cpp` | The Cameras settings page. |
-
-Notable details:
-
-- **Bulk framing.** A bulk URB can contain several UVC payloads and a payload can
-  span several URBs, so the parser keeps payload state across URBs. The
-  negotiated `dwMaxPayloadTransferSize` counts the header, and the URB is sized to
-  it. The EPOS camera needs 64 KB transfers; 8 KB produced torn frames.
-- **Isochronous size.** The USB2 high-bandwidth multiplier is applied, and the
-  USB3 companion descriptor's `wBytesPerInterval` is used when present.
-- **FID fallback.** If a camera never sets EOF (common when two streams run at
-  once), a FID toggle also ends the frame instead of discarding it.
-- **Liveness.** A stream that has not delivered a frame for 3 s (including "never
-  delivered") is considered dead and restarted.
-- **Teardown.** The dup'ed usbfs fd is closed after `libusb_close`, transfers are
-  freed only after the event thread has exited, and frames are delivered from a
-  separate thread so the libusb callback never runs blocking network code.
-
-### Server
-
-| File | Role |
-|---|---|
-| `server/camera/camera_sink.h` | Sink interface (`process_frame`, `update_cameras`, `set_camera_device`, `assignment`) |
-| `server/camera/camera_v4l2.{h,cpp}` | MJPEG decode, chroma conversion, v4l2loopback output, assignment + persistence |
-| `server/camera/camera_dump.cpp` | Sink factory; `WIVRN_CAMERA_DUMP` debug sink |
-| `server/driver/wivrn_session.cpp` | Creates the sink, forwards frames, sends descriptions/assignments |
-
-The v4l2 node is opened `O_NONBLOCK`; a slow consumer means "drop this frame",
-not "block the whole session". `VIDIOC_S_FMT` is always read back with
-`VIDIOC_G_FMT` and every write is checked against the mapped buffer, because a
-driver may clamp the format.
-
----
-
-## Limitations
-
-- **MJPEG only.** Cameras without an MJPEG format are rejected at capture start
-  with a clear log message. Supporting YUYV would need an encoder or a raw path.
-- **Camera frames share the TCP control socket** with tracking feedback and GUI
-  commands. A very congested link can delay control traffic by a frame time.
-  Sends have a 5 s timeout so a dead link cannot hang teardown.
-- **Decode runs on the session network thread.** Roughly 5-8 ms per 720p frame;
-  fine for 2 cameras, likely the first thing to optimise for 3+.
-- **The v4l2 device allocator is per session.** Two headsets connected at once
-  would both try `/dev/video10`. Not an issue for a single-headset setup.
-- **EPOS EXPAND Vision 1 is flaky** in general (it sometimes outputs a static
-  "camera off" image instead of video). It is not the passthrough that breaks.
-- **Reboot automation is manual**: start `wivrn-server`, then launch the app on
-  the headset.
-- The camera resolution is negotiated to the closest size the camera supports; the
-  server asks for 1280x720@30.
-
----
-
-## Upstream
-
-This fork tracks [WiVRn/WiVRn](https://github.com/WiVRn/WiVRn). Everything that is
-not camera-related is upstream code; see the upstream README history and
-[`docs/`](docs/) for the rest of the documentation (building, configuration,
-debugging, SteamVR, NVENC, profiling, Flatpak).
-
-Licensed under the GNU General Public License v3.0, same as upstream. libusb is
-statically linked into the APK under the LGPL-2.1; its licence text is included in
-the app's licence directory.
+The release APK uses package `org.meumeu.wivrn.camera`, so it coexists with
+upstream WiVRn.
