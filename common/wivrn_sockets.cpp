@@ -23,12 +23,14 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cassert>
+#include <linux/sockios.h>
 #include <memory>
 #include <netdb.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <string.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -138,6 +140,14 @@ void wivrn::UDP::set_receive_buffer_size(int size)
 void wivrn::UDP::set_send_buffer_size(int size)
 {
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+}
+
+size_t wivrn::TCP::send_queue_bytes()
+{
+	int queued = 0;
+	if (ioctl(fd, SIOCOUTQ, &queued) < 0)
+		return 0;
+	return size_t(std::max(queued, 0));
 }
 
 void wivrn::UDP::set_tos(int tos)

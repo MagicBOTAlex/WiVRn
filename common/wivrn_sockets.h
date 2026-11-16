@@ -143,6 +143,10 @@ class TCP : public fd_base
 	crypto::encrypt_context encrypter;
 
 public:
+	// Bytes still queued in the kernel for this connection. Used to drop
+	// droppable traffic (camera frames) before it can stall the control path.
+	size_t send_queue_bytes();
+
 	TCP() = default;
 	TCP(sockaddr_in6 address);
 	TCP(sockaddr_in address);

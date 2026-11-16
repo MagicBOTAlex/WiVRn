@@ -225,6 +225,7 @@ void scenes::stream::start_camera_sender()
 
 	queue->thread = utils::named_thread("camera_sender", [this, queue]() {
 		uint64_t errors = 0;
+		uint64_t dropped = 0;
 		while (true)
 		{
 			from_headset::camera_frame frame;
@@ -239,6 +240,18 @@ void scenes::stream::start_camera_sender()
 				}
 				frame = std::move(queue->frames.front());
 				queue->frames.pop_front();
+			}
+
+			// Camera frames are droppable; the control socket is not. If the link
+			// is backed up, drop the frame rather than queue behind feedback and
+			// video keyframes (and risk a send timeout, which corrupts framing).
+			constexpr size_t max_control_backlog = 512 * 1024;
+			if (network_session->control_send_queue_bytes() > max_control_backlog)
+			{
+				if (dropped++ % 30 == 0)
+					spdlog::warn("camera frame dropped: control socket backlog {} bytes",
+					             network_session->control_send_queue_bytes());
+				continue;
 			}
 
 			try

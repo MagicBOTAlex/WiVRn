@@ -60,6 +60,16 @@ public:
 	wivrn_session(const wivrn_session &) = delete;
 	wivrn_session & operator=(const wivrn_session &) = delete;
 
+	// Depth of the control (TCP) send queue. Camera frames use the same socket
+	// as feedback and video keyframes; when it backs up, dropping a camera
+	// frame is much cheaper than letting the whole control path stall (a
+	// partial write on timeout desynchronises the framing and kills the
+	// session).
+	size_t control_send_queue_bytes()
+	{
+		return control.send_queue_bytes();
+	}
+
 	template <typename T>
 	void send_control(T && packet)
 	{
