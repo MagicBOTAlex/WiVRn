@@ -49,6 +49,11 @@ public:
 	static std::vector<steam> find_installations();
 
 	std::vector<application> list_applications();
+
+	// Library roots of this installation, including the main install root.
+	// Libraries whose path is not currently mounted are excluded.
+	std::vector<std::filesystem::path> library_roots() const;
+
 	std::string get_steam_command() const;
 };
 

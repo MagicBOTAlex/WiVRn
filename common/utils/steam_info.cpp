@@ -20,11 +20,13 @@
 #include "steam_info.h"
 #include "vdf.h"
 #include "xdg_base_directory.h"
+#include <algorithm>
 #include <bit>
 #include <charconv>
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
@@ -175,6 +177,56 @@ std::optional<uint32_t> guess_steam_userid(const std::filesystem::path & root)
 	}
 }
 
+// Path of a library, from its entry in libraryfolders.vdf. Returns nullopt if
+// the entry does not have the expected structure.
+std::optional<std::filesystem::path> library_path(const wivrn::vdf::keyvalue & kv)
+{
+	using values_t = std::vector<wivrn::vdf::keyvalue>;
+
+	// Old versions of the file store the path directly as the value
+	if (auto path = std::get_if<wivrn::vdf::string>(&kv.value))
+		return std::filesystem::path{path->data};
+
+	if (auto entries = std::get_if<values_t>(&kv.value))
+	{
+		for (const auto & [key, value]: *entries)
+		{
+			if (key == "path")
+			{
+				if (auto path = std::get_if<wivrn::vdf::string>(&value))
+					return std::filesystem::path{path->data};
+			}
+		}
+	}
+
+	return {};
+}
+
+// lexically_normal() keeps a trailing separator, which makes otherwise equal
+// paths compare differently.
+std::filesystem::path normalized(const std::filesystem::path & path)
+{
+	auto res = path.lexically_normal();
+	while (res.has_relative_path() and res.filename().empty())
+		res = res.parent_path();
+	return res;
+}
+
+// A library is usable if its path is currently mounted. Steam keeps unmounted
+// libraries in libraryfolders.vdf, but applications stored there cannot be
+// started. Entries whose path cannot be determined are kept, and so is the
+// main installation root.
+bool library_available(const std::filesystem::path & root, const wivrn::vdf::keyvalue & kv)
+{
+	auto path = library_path(kv);
+	if (not path)
+		return true;
+	if (normalized(*path) == normalized(root))
+		return true;
+	std::error_code ec;
+	return std::filesystem::exists(*path, ec) and not ec;
+}
+
 std::unordered_set<uint64_t> installed_appids(std::filesystem::path root)
 {
 	std::unordered_set<uint64_t> res;
@@ -185,14 +237,45 @@ std::unordered_set<uint64_t> installed_appids(std::filesystem::path root)
 		if (vdf.key != "libraryfolders")
 			return {};
 
+		// Collect every app id first, then keep only those whose manifest is in a
+		// library that is actually present. Filtering the library list itself is
+		// wrong: Steam can leave an app's id in an unmounted library's list while
+		// its manifest (and files) live in the main library, and dropping the
+		// entry made installed games disappear from the launcher.
+		std::vector<std::filesystem::path> libraries;
 		for (const auto & kv: std::get<values_t>(vdf.value))
 		{
-			for (const auto & [appid, _]: std::get<values_t>(kv["apps"].value))
+			if (auto path = library_path(kv))
+				libraries.push_back(normalized(*path));
+
+			try
 			{
-				uint64_t val;
-				if (std::from_chars(appid.data.begin(), appid.data.end(), val).ec == std::errc())
-					res.emplace(val);
+				for (const auto & [appid, _]: std::get<values_t>(kv["apps"].value))
+				{
+					uint64_t val;
+					if (std::from_chars(appid.data.begin(), appid.data.end(), val).ec == std::errc())
+						res.emplace(val);
+				}
 			}
+			catch (std::out_of_range &)
+			{
+				// No apps dictionary in this entry
+			}
+		}
+
+		if (not libraries.empty())
+		{
+			auto manifest_present = [&](uint64_t appid) {
+				auto name = std::format("appmanifest_{}.acf", appid);
+				for (const auto & library: libraries)
+				{
+					std::error_code ec;
+					if (std::filesystem::exists(library / "steamapps" / name, ec) and not ec)
+						return true;
+				}
+				return false;
+			};
+			std::erase_if(res, [&](uint64_t appid) { return not manifest_present(appid); });
 		}
 	}
 	catch (...)
@@ -505,6 +588,38 @@ std::vector<wivrn::steam::application> wivrn::steam::list_applications()
 				std::cerr << "Listing Steam applications failed (" << entry.path().filename() << "): " << e.what() << std::endl;
 			}
 	}
+
+	return res;
+}
+
+std::vector<std::filesystem::path> wivrn::steam::library_roots() const
+{
+	// The installation root is always available
+	std::vector<std::filesystem::path> res{normalized(root)};
+
+	try
+	{
+		wivrn::vdf::root vdf(root / "config/libraryfolders.vdf");
+		using values_t = std::vector<wivrn::vdf::keyvalue>;
+		if (vdf.key != "libraryfolders")
+			return res;
+
+		for (const auto & kv: std::get<values_t>(vdf.value))
+		{
+			if (not library_available(root, kv))
+				continue;
+
+			auto path = library_path(kv);
+			if (not path)
+				continue;
+
+			path = normalized(*path);
+			if (std::find(res.begin(), res.end(), *path) == res.end())
+				res.push_back(std::move(*path));
+		}
+	}
+	catch (...)
+	{}
 
 	return res;
 }

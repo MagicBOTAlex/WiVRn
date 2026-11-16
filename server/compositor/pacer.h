@@ -40,9 +40,12 @@ class pacer
 public:
 	struct frame_info
 	{
-		int64_t frame_id;
-		int64_t present_ns;
-		int64_t predicted_display_time;
+		// -1 marks an entry that is not (or no longer) in flight: a fresh
+		// array or a reset must never look like a valid prediction, otherwise
+		// feedback for the previous session would be matched against it.
+		int64_t frame_id = -1;
+		int64_t present_ns = 0;
+		int64_t predicted_display_time = 0;
 	};
 
 private:
@@ -51,7 +54,9 @@ private:
 	int64_t last_ns = 0;
 	int64_t frame_id = 0;
 
-	int64_t mean_wake_up_to_present_ns = 1'000'000;
+	// 0 means "no sample yet": the means are seeded from the first measurement
+	// instead of converging from an arbitrary starting point.
+	int64_t mean_wake_up_to_present_ns = 0;
 	int64_t safe_present_to_decoded_ns = 0;
 	int64_t mean_render_to_display_ns = 0;
 

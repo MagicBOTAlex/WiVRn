@@ -287,6 +287,36 @@ void systemd_units_manager::start_application(const std::vector<std::string> & a
 		                      g_variant_new("as", &pathv));
 	}
 
+	// A transient unit does not inherit the environment of the server, but a
+	// graphical application needs the session variables to find the display
+	// server and the OpenXR runtime. Only forward the variables that are set,
+	// and do not emit an empty Environment property.
+	static const char * const environment_names[] = {
+	        "DISPLAY",
+	        "WAYLAND_DISPLAY",
+	        "XDG_RUNTIME_DIR",
+	        "DBUS_SESSION_BUS_ADDRESS",
+	        "XDG_DATA_DIRS",
+	        "XR_RUNTIME_JSON",
+	};
+	std::vector<std::string> environment;
+	for (const char * name: environment_names)
+	{
+		const char * value = std::getenv(name);
+		if (value != nullptr and *value != '\0')
+			environment.emplace_back(std::format("{}={}", name, value));
+	}
+	if (not environment.empty())
+	{
+		variant_builder environmentv(G_VARIANT_TYPE("as"));
+		for (const auto & item: environment)
+			g_variant_builder_add(&environmentv, "s", item.c_str());
+		g_variant_builder_add(&b,
+		                      "(sv)",
+		                      "Environment",
+		                      g_variant_new("as", &environmentv));
+	}
+
 	auto properties = b.end();
 	auto aux = g_variant_new_array(G_VARIANT_TYPE("(sa(sv))"), nullptr, 0);
 

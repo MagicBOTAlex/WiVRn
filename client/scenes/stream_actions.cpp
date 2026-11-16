@@ -21,6 +21,7 @@
 #include "stream.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <ranges>
 #include <spdlog/spdlog.h>
@@ -96,6 +97,39 @@ constexpr std::array frame_gamepad_ids = {
         device_id::GAMEPAD_THUMBSTICK_RIGHT_X,
         device_id::GAMEPAD_THUMBSTICK_RIGHT_Y,
 };
+
+// Query cache for read_actions().
+//
+// input_actions holds the inputs of every supported interaction profile (~120
+// entries), but a given profile only binds a fraction of them (~25 on Touch). The
+// other ones cost a xrGetActionState* call per frame each, for a result that is
+// always isActive == false. We remember which actions are bound and stop querying
+// the others, and query everything again when the interaction profile changes or
+// periodically, so that an input can never be silently dropped.
+//
+// The bookkeeping only matters to read_actions(), so it lives here instead of in
+// the scene header. A new stream instance gets a fresh cache: the owner and the
+// action list storage identify the instance the bits belong to.
+struct action_query_state
+{
+	const void * owner = nullptr;
+	const void * actions = nullptr;
+	bool active = true;          // whether read_actions() queries the action
+	uint8_t inactive_frames = 0; // consecutive frames the action was not active
+};
+
+// An action is only dropped after it has been inactive for a while: a trigger at
+// rest is still active in OpenXR terms, but a transient failure (or a session that
+// briefly loses focus) must not make an input disappear from the packet.
+constexpr uint8_t action_inactive_frames_limit = 90; // ~1 s at 90 Hz
+constexpr uint32_t action_rescan_period = 300;       // ~3.3 s at 90 Hz
+
+std::vector<action_query_state> action_states;
+const void * action_states_owner = nullptr;
+const void * action_states_actions = nullptr;
+std::array<interaction_profile, 3> action_states_profiles{};
+uint32_t action_frames_since_rescan = 0;
+std::chrono::steady_clock::time_point last_action_stats_log{};
 } // namespace
 
 bool scenes::stream::chord_state::check(XrTime now)
@@ -156,11 +190,49 @@ void scenes::stream::read_actions()
 {
 	from_headset::inputs inputs;
 	const bool emulating_gamepad = using_frame_gamepad();
+	const bool focused = application::is_focused();
+
+	// The set of bound actions changes with the interaction profile. The profile
+	// values are updated on this thread, so comparing them catches the change even
+	// if the notification has already been consumed by the tracking thread. The
+	// flag is only read here (the tracking thread consumes it), so that both can
+	// react to the event.
+	const std::array<interaction_profile, 3> profiles = {
+	        interaction_profiles[0].load(),
+	        interaction_profiles[1].load(),
+	        interaction_profiles[2].load(),
+	};
+
+	const bool rescan = action_states.size() != input_actions.size() or
+	                    action_states_owner != this or
+	                    action_states_actions != input_actions.data() or
+	                    action_states_profiles != profiles or
+	                    interaction_profile_changed;
+
+	// Also rescan periodically: a missed profile change must not leave an input
+	// ignored forever.
+	if (rescan or ++action_frames_since_rescan >= action_rescan_period)
+	{
+		action_states.assign(input_actions.size(), {});
+		action_states_owner = this;
+		action_states_actions = input_actions.data();
+		action_states_profiles = profiles;
+		action_frames_since_rescan = 0;
+	}
+
+	size_t queried = 0;
+	size_t active = 0;
 
 	if (not is_gui_interactable())
 	{
-		for (const auto & [id, action, action_type]: input_actions)
+		for (size_t i = 0; i < input_actions.size(); ++i)
 		{
+			auto & query = action_states[i];
+			if (not query.active)
+				continue; // Known to be unbound by the current profile
+
+			const auto & [id, action, action_type] = input_actions[i];
+
 			device_id output_id = id;
 			if (emulating_gamepad)
 			{
@@ -170,10 +242,26 @@ void scenes::stream::read_actions()
 				output_id = *mapped_id;
 			}
 
+			// Feed the result of the query back into the cache. While the session is
+			// not focused every action reports inactive without even reaching the
+			// runtime, so nothing is learned in that case.
+			auto update_query_state = [&](bool is_active) {
+				if (is_active)
+				{
+					query.active = true;
+					query.inactive_frames = 0;
+					++active;
+				}
+				else if (focused and ++query.inactive_frames >= action_inactive_frames_limit)
+					query.active = false;
+			};
+
 			switch (action_type)
 			{
 				case XR_ACTION_TYPE_BOOLEAN_INPUT: {
 					auto value = application::read_action_bool(action);
+					++queried;
+					update_query_state(value.has_value());
 					if (value)
 						inputs.values.push_back({output_id, (float)value->second, value->first});
 				}
@@ -181,6 +269,8 @@ void scenes::stream::read_actions()
 
 				case XR_ACTION_TYPE_FLOAT_INPUT: {
 					auto value = application::read_action_float(action);
+					++queried;
+					update_query_state(value.has_value());
 					if (value)
 						inputs.values.push_back({output_id, value->second, value->first});
 				}
@@ -188,6 +278,8 @@ void scenes::stream::read_actions()
 
 				case XR_ACTION_TYPE_VECTOR2F_INPUT: {
 					auto value = application::read_action_vec2(action);
+					++queried;
+					update_query_state(value.has_value());
 					if (value)
 					{
 						inputs.values.push_back({output_id, value->second.x, value->first});
@@ -205,6 +297,14 @@ void scenes::stream::read_actions()
 					break;
 			}
 		}
+	}
+
+	// Rate limited to once per second so that it can stay enabled while debugging.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last_action_stats_log >= std::chrono::seconds(1))
+	{
+		last_action_stats_log = now;
+		spdlog::debug("Input actions: {} total, {} queried, {} active", input_actions.size(), queried, active);
 	}
 
 	if (emulating_gamepad)

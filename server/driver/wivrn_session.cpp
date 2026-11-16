@@ -20,6 +20,8 @@
 
 #include "wivrn_session.h"
 
+#include <fstream>
+
 #include <cmath>
 #include <set>
 
@@ -840,6 +842,44 @@ void wivrn_session::operator()(from_headset::feedback && feedback)
 		return;
 	compositor.on_feedback(feedback, o);
 
+	// Per-frame timing export. The 90-frame means that WIVRN_PIPELINE_STATS
+	// prints hide exactly the tail that the pacer's p99.5 keys off, so this
+	// writes one line per frame (headset clock, microseconds) for real
+	// percentile analysis. Opt-in and append-only.
+	{
+		static const char * feedback_csv = getenv("WIVRN_FEEDBACK_CSV");
+		if (feedback_csv)
+		{
+			static std::mutex csv_mutex;
+			static std::ofstream csv;
+			std::lock_guard lock(csv_mutex);
+			if (not csv.is_open())
+			{
+				csv.open(feedback_csv, std::ios::app);
+				if (csv)
+					csv << "frame,stream,encode_begin,encode_end,send_begin,send_end,"
+					       "received_first_packet,received_last_packet,sent_to_decoder,"
+					       "received_from_decoder,blitted,displayed,times_displayed\n";
+			}
+			if (csv)
+			{
+				csv << feedback.frame_index << ',' << int(feedback.stream_index);
+				for (auto t: {feedback.encode_begin,
+				              feedback.encode_end,
+				              feedback.send_begin,
+				              feedback.send_end,
+				              feedback.received_first_packet,
+				              feedback.received_last_packet,
+				              feedback.sent_to_decoder,
+				              feedback.received_from_decoder,
+				              feedback.blitted,
+				              feedback.displayed})
+					csv << ',' << (t / 1000); // ns -> us
+				csv << ',' << int(feedback.times_displayed) << '\n';
+			}
+		}
+	}
+
 	if (feedback.received_first_packet)
 		trace::instant_feedback("receive_begin", o.from_headset(feedback.received_first_packet), feedback.frame_index, feedback.stream_index);
 	if (feedback.received_last_packet)
@@ -984,10 +1024,12 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 		// FIXME: use locale. A missing default name must not throw here: the
 		// response is built before it is sent, so one unnamed app would leave the
 		// headset with no application list at all.
+		// Fall back to the id when the name is missing *or empty*: an empty
+		// string renders as a nameless tile in the launcher.
 		auto name = app.name.find("");
 		response.applications.emplace_back(
 		        id,
-		        name != app.name.end() ? name->second : id);
+		        (name != app.name.end() and not name->second.empty()) ? name->second : id);
 	}
 	send_control(std::move(response));
 
