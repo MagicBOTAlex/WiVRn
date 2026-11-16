@@ -3,7 +3,7 @@
 <p align="center"><img src="images/wivrn.svg" width="140"></p>
 
 This is a fork of [WiVRn](https://github.com/WiVRn/WiVRn) that adds **USB (UVC)
-camera passthrough from the headset to the PC**.
+camera passthrough from the headset to the PC**. Completely done by deepseek. Slop probably included.
 
 Plug a webcam into a Meta Quest 3, and it shows up on the Linux PC as
 `/dev/video10` (or 11, 12, ...) through
