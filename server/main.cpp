@@ -538,7 +538,10 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 				                   }
 				                   catch (std::exception & e)
 				                   {
-					                   std::cerr << "Failed to launch application " << it->second.name.at("") << ": " << e.what() << std::endl;
+					                   auto name = it->second.name.find("");
+					                   std::cerr << "Failed to launch application "
+					                             << (name != it->second.name.end() ? name->second : it->first)
+					                             << ": " << e.what() << std::endl;
 				                   }
 			                   }
 		                   },

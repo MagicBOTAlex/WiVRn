@@ -981,10 +981,13 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 
 	for (const auto & [id, app]: apps)
 	{
+		// FIXME: use locale. A missing default name must not throw here: the
+		// response is built before it is sent, so one unnamed app would leave the
+		// headset with no application list at all.
+		auto name = app.name.find("");
 		response.applications.emplace_back(
-		        std::move(id),
-		        // FIXME: use locale
-		        app.name.at(""));
+		        id,
+		        name != app.name.end() ? name->second : id);
 	}
 	send_control(std::move(response));
 

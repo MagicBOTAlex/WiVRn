@@ -29,9 +29,10 @@ Apps::Apps(QObject * parent)
 
 	for (const auto & [id, app]: apps)
 	{
+		auto name = app.name.find("");
 		m_apps.push_back(
 		        vrApp(
-		                QString::fromStdString(app.name.at("")),
+		                QString::fromStdString(name != app.name.end() ? name->second : id),
 		                QString::fromStdString(app.exec)));
 	}
 
