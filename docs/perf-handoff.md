@@ -530,6 +530,20 @@ Fixed in `1d4580e8`:
 
 Re-ran at the same 3136x3264 settings: **0 dropped keyframes** (was 11).
 
+VRChat, 2624x2752/eye @ 49.3 Mbit/s: encode 6.9, net 2.3, decode 6.8, blit
+19.8, display 19.7, total 55.6 ms; 4 keyframe requests, 0 dropped keyframes, 0
+client drops, 0 MediaCodec errors.
+
+**The GPU is not the limiter.** At every one of these settings the 4080 SUPER
+reports `utilization.gpu = 100%` while drawing only ~72 W of a 320 W limit at
+max SM/memory clocks — the SMs are idle between frames. Raising the resolution
+makes the *stream* the bottleneck, so the app is throttled and GPU utilisation
+goes *down*, not up. If a profiler says "GPU 30%", look at `blit`/`display`
+first.
+
+Two OpenXR apps cannot share the session: whichever connects last owns it and
+the other idles, which silently invalidates a measurement.
+
 ### T10 — Remaining measured items (small, low risk)
 
 - `client/scenes/stream.cpp:910-915`: `getResults(..., eWait)` is redundant
