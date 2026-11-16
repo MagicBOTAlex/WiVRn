@@ -78,7 +78,17 @@
                 };
 
                 buildInputs = oldAttrs.buildInputs ++ extraBuildInputs;
+                # NVENC dlopen()s libcuda at runtime. NixOS does not put the
+                # driver libraries on the default search path, so without this
+                # the packaged server starts and then reports "nvenc not
+                # supported" for every codec.
                 nativeBuildInputs = oldAttrs.nativeBuildInputs ++ extraNativeBuildInputs;
+
+                # The addDriverRunpath hook does not touch this binary (its rpath
+                # ends up glibc-only), so add the driver directory explicitly.
+                postFixup = (oldAttrs.postFixup or "") + ''
+                  patchelf --add-rpath /run/opengl-driver/lib $out/bin/wivrn-server
+                '';
                 cmakeFlags = (lib.filter (flag: !lib.hasInfix "GIT_" flag) oldAttrs.cmakeFlags) ++ [
                   (lib.cmakeFeature "GIT_DESC" "nightly")
                   (lib.cmakeFeature "GIT_COMMIT" "nightly")
