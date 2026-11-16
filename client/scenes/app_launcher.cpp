@@ -290,16 +290,39 @@ void app_launcher::operator()(to_headset::application_list && apps)
 	locked->reserve(apps.applications.size());
 	for (const auto & i: apps.applications)
 	{
-		locked->push_back(app{
+		app a{
 		        .id = std::move(i.id),
 		        .name = std::move(i.name),
-		});
+		};
+		// An icon that arrived before the list was buffered; attach it now.
+		if (auto it = pending_icons.find(a.id); it != pending_icons.end())
+		{
+			a.image = std::move(it->second);
+			pending_icons.erase(it);
+		}
+		locked->push_back(std::move(a));
 	}
+
+	// A new list may carry new icons for ids we already uploaded. Drop the
+	// cached textures so texture_for uploads the new image instead of keeping
+	// the stale one forever.
+	app_icons.clear();
 }
 
 void app_launcher::operator()(to_headset::application_icon && icon)
 {
 	auto locked = applications.lock();
 	if (auto it = std::ranges::find(*locked, icon.id, &app::id); it != locked->end())
+	{
 		it->image = std::move(icon.image);
+		// The list may be replaced later; make sure this image is not cached
+		// under the old one.
+		app_icons.erase(icon.id);
+	}
+	else
+	{
+		// The list has not arrived yet (or is being replaced): keep the image so
+		// the app does not end up with a generic icon.
+		pending_icons.insert_or_assign(icon.id, std::move(icon.image));
+	}
 }

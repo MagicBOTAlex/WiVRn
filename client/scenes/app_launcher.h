@@ -45,6 +45,9 @@ class app_launcher
 	imgui_textures textures;
 	ImTextureID default_icon;
 	std::unordered_map<std::string, ImTextureID> app_icons;
+	// Icons that arrived before the list they belong to. Without this they were
+	// silently dropped and the app kept its generic icon until a manual refresh.
+	std::unordered_map<std::string, std::vector<std::byte>> pending_icons;
 	// Last application list received from server
 	thread_safe<std::vector<app>> applications;
 

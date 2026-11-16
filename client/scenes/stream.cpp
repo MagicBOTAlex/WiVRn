@@ -743,18 +743,29 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 	}
 	else
 	{
-		spdlog::warn("Failed to find a common frame for all decoders, dumping available frames per decoder");
-		for (const auto & decoder: decoders)
+		// This path runs exactly when a decoder is late, i.e. under load, and it
+		// used to build and emit four warn lines every frame. The Android logger
+		// is synchronous, so that was 0.5-2 ms of render-thread time in a
+		// positive feedback loop with the desync it reports. Log once a second.
+		static auto last_warn = std::chrono::steady_clock::time_point{};
+		const auto now = std::chrono::steady_clock::now();
+		const bool warn = now - last_warn > std::chrono::seconds(1);
+		if (warn)
 		{
-			std::string frames;
-			for (const auto & frame: decoder.latest_frames)
+			last_warn = now;
+			spdlog::warn("Failed to find a common frame for all decoders, dumping available frames per decoder");
+			for (const auto & decoder: decoders)
 			{
-				if (frame)
-					frames += " " + std::to_string(frame->feedback.frame_index);
-				else
-					frames += " -";
+				std::string frames;
+				for (const auto & frame: decoder.latest_frames)
+				{
+					if (frame)
+						frames += " " + std::to_string(frame->feedback.frame_index);
+					else
+						frames += " -";
+				}
+				spdlog::warn(frames);
 			}
-			spdlog::warn(frames);
 		}
 
 		for (auto [i, decoder]: utils::enumerate(decoders))

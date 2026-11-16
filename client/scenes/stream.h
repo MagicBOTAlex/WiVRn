@@ -154,11 +154,15 @@ private:
 
 	void set_state(state new_state)
 	{
-		state prev = state_;
-		if (prev == state::shutdown)
-			return;
-
-		state_.compare_exchange_strong(prev, new_state);
+		// Retry until it sticks. A single compare_exchange_strong could lose a
+		// transition when the decoder thread and the render thread raced, which
+		// left the scene in a state that neither of them expected.
+		state prev = state_.load();
+		do
+		{
+			if (prev == state::shutdown)
+				return;
+		} while (not state_.compare_exchange_weak(prev, new_state));
 	}
 
 	client_foveation::center foveation_center;

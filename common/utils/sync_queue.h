@@ -86,6 +86,27 @@ public:
 		return {};
 	}
 
+	// Like pop_if, but waits at most `timeout`. On timeout, or when the front
+	// item does not match, returns nullopt and leaves the queue untouched.
+	template <typename Pred>
+	std::optional<T> pop_if_for(Pred && pred, std::chrono::milliseconds timeout)
+	{
+		std::unique_lock lock(mutex);
+
+		if (not cv.wait_for(lock, timeout, [&]() { return !queue.empty() || closed; }))
+			return std::nullopt;
+
+		if (closed)
+			throw sync_queue_closed{};
+
+		if (queue.empty() or not pred(queue.front()))
+			return std::nullopt;
+
+		T item = std::move(queue.front());
+		queue.pop_front();
+		return item;
+	}
+
 	// Waits up to `timeout` for an item; nullopt on timeout. Used to apply
 	// backpressure to a producer when the consumer is temporarily saturated.
 	std::optional<T> pop_for(std::chrono::milliseconds timeout)

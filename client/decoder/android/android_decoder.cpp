@@ -122,7 +122,7 @@ decoder::decoder(
 	              height,
 	              AIMAGE_FORMAT_PRIVATE,
 	              AHARDWAREBUFFER_USAGE_CPU_READ_NEVER | AHARDWAREBUFFER_USAGE_CPU_WRITE_NEVER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
-	              scenes::stream::image_buffer_size + 4 /* maxImages */,
+	              scenes::stream::image_buffer_size + 1 /* maxImages */,
 	              &ir),
 	      "AImageReader_newWithUsage");
 	image_reader.reset(ir, AImageReader_deleter{});
@@ -354,7 +354,14 @@ void decoder::on_image_available(AImageReader * reader)
 
 		frame_infos.drop_until([frame_index](auto & x) { return x.feedback.frame_index >= frame_index; });
 
-		auto info = frame_infos.pop_if([frame_index](auto & x) { return x.feedback.frame_index == frame_index; });
+		// pop_if waits for a non-empty queue with no timeout. If the matching
+		// entry was dropped (drop_until above) and the stream then pauses, the
+		// image-reader thread blocks forever, which stops image delivery and
+		// stalls the codec. Wait briefly, then give up and drop the frame; a
+		// non-matching front entry is left in place for its own image.
+		auto info = frame_infos.pop_if_for(
+		        [frame_index](auto & x) { return x.feedback.frame_index == frame_index; },
+		        std::chrono::milliseconds(20));
 
 		if (!info)
 		{
