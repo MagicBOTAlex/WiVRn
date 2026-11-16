@@ -660,6 +660,25 @@ reconnect instead of freezing. Measure with a scoped timer around the enqueue
 
 ---
 
+## 4b. Validation results (2026-11-16, after the guardian dialog was dismissed)
+
+- **Smoke** (`tools/stream-test.sh`, Beat Saber, 90 s, cameras on): 228 samples,
+  median 32.8 ms, p95 35.2 ms, **0 network exceptions, 0 decoder drops,
+  0 sender stalls**, 2 keyframe requests + 2 local drops, all recovered.
+- **T13 stall test** (SIGSTOP the server worker for 4 s, no root needed):
+  `blit` stayed **3.8-6.7 ms** and `total` 31.5-32.4 ms across the stall, with
+  0 network exceptions and 0 writer failures. Before T13 this froze the render
+  thread in `sendmsg` for seconds. **T13 validated.**
+- **Chunked keyframes**: 2 keyframes requested during the stall, **0 dropped**,
+  so the 64 KB chunks reassemble correctly. **`f64b5b5f` validated.**
+- **Pacer**: `lead` 24.9-26.5 ms, `safe_present_to_decoded` 17.0 ms,
+  `wake_to_present` 0.2 ms, `render_to_display` 16.0 ms, **`deficit` -7.7 to
+  -9.1 ms** (negative: the schedule is ahead, no bump). Two "schedule behind"
+  warnings, both explained: one on the first frame (`last_ns` cold start) and
+  one for a real ~1 s stall, which the 2-period clamp + re-anchor handled.
+- Remaining to check by hand: controller inputs in a game (action filter), and
+  the launcher tiles/names/icons.
+
 ## 4b. Test plan for the blind-shipped changes
 
 Everything from `9f59875e` and `f64b5b5f` was written without a headset run (a

@@ -69,16 +69,22 @@ say "server pid(s): $(pgrep -x wivrn-server | tr '\n' ' ')"
 
 # --- connect the headset -------------------------------------------------------
 say "== connecting headset"
-adb shell am force-stop "$pkg" >/dev/null 2>&1
-sleep 2
-adb shell am start -a android.intent.action.VIEW -d "wivrn://192.168.50.58:9757" \
-	-n "$pkg/org.meumeu.wivrn.MainActivity" >/dev/null 2>&1
+# Do NOT force-stop a running client: Android revokes USB permission grants when
+# an app is force-stopped, so every run popped the camera permission dialog again.
+if [ -z "$(adb shell pidof "$pkg" 2>/dev/null | tr -d '\r')" ]; then
+	adb shell am start -a android.intent.action.VIEW -d "wivrn://192.168.50.58:9757" \
+		-n "$pkg/org.meumeu.wivrn.MainActivity" >/dev/null 2>&1
+else
+	say "client already running, reusing it"
+	adb shell am start -a android.intent.action.VIEW -d "wivrn://192.168.50.58:9757" \
+		-n "$pkg/org.meumeu.wivrn.MainActivity" >/dev/null 2>&1
+fi
 
 connected() {
 	# The server logs the session in several ways depending on the path; the
 	# camera description only appears once the headset has completed the
 	# handshake, so accept any of them.
-	grep -qE "client_connected|Streaming [0-9]+ camera|Started native session" "$log"
+	grep -qiE "client connected|Streaming [0-9]+ camera|Started native session|Session state changed: XR_SESSION_STATE_FOCUSED" "$log"
 }
 for _ in $(seq 1 30); do
 	sleep 1
