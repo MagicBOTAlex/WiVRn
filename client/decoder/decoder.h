@@ -65,7 +65,10 @@ public:
 	        std::weak_ptr<scenes::stream>,
 	        shard_accumulator *);
 	virtual ~decoder();
-	virtual void push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) = 0;
+	// Returns false when the frame was rejected and will never reach the decoder.
+	// The caller must report that to the server so it can request an IDR: with an
+	// infinite GOP a silently lost reference is never repaired.
+	virtual bool push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) = 0;
 
 	virtual void frame_completed(
 	        const from_headset::feedback & feedback,

@@ -190,13 +190,19 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 		payload_buffer.emplace_back(data_shards[idx]->payload);
 
 	bool frame_complete = last_idx == data_shards.size() and data_shards.back()->timing_info;
-	decoder_->push_data(payload_buffer, data_shards[shard_idx]->frame_idx, not frame_complete);
+	bool submitted = decoder_->push_data(payload_buffer, data_shards[shard_idx]->frame_idx, not frame_complete);
 
 	if (not frame_complete)
 		return;
 
 	current.feedback.received_last_packet = instance.now();
-	current.feedback.sent_to_decoder = current.feedback.received_last_packet;
+	// Only claim the frame reached the decoder if it did. A false claim here is
+	// what turns a single dropped frame into a permanently corrupted stream:
+	// the server never learns it must send a keyframe.
+	if (submitted)
+		current.feedback.sent_to_decoder = current.feedback.received_last_packet;
+	else
+		current.feedback.sent_to_decoder = 0;
 	data_shard::timing_info_t timing_info = data_shards.back()->timing_info.value_or(data_shard::timing_info_t{});
 	current.feedback.encode_begin = timing_info.encode_begin;
 	current.feedback.encode_end = timing_info.encode_end;
@@ -209,8 +215,10 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 		return;
 	}
 
-	// Try to extract a frame
-	decoder_->frame_completed(current.feedback, *data_shards.front()->view_info);
+	// Do not enqueue a frame_info for a frame the decoder never saw: no image
+	// will ever come back for it, and the entry would desynchronise the queue.
+	if (submitted)
+		decoder_->frame_completed(current.feedback, *data_shards.front()->view_info);
 
 	send_feedback(current.feedback);
 

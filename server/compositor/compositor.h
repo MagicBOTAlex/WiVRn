@@ -34,7 +34,10 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 namespace wivrn
@@ -104,13 +107,26 @@ private:
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
-#ifdef __cpp_lib_atomic_lock_free_type_aliases
-	using status_type = std::atomic_signed_lock_free;
-#else
-	using status_type = std::atomic_int8_t;
-#endif
-	status_type encode_request{-1}; // id of the image to encode
-	std::jthread encoder_thread;
+	// One encode worker per encoder. Two NVENC sessions encode the two eyes in
+	// parallel (~1.4 ms off the two-eye path), and a failure in one stream can
+	// no longer starve the others (the old single try/catch around the whole
+	// loop left sibling slots busy forever).
+	struct encode_job
+	{
+		uint64_t epoch;
+		int image;
+		uint64_t frame_index;
+		to_headset::video_stream_data_shard::view_info_t view_info;
+		std::atomic<int> remaining{0};
+	};
+	std::mutex job_mutex;
+	std::condition_variable job_cv;
+	std::deque<std::shared_ptr<encode_job>> jobs;
+	uint64_t next_job_epoch = 1;
+	std::array<std::jthread, 3> encoder_threads;
+
+	bool submit_encode_job(int image);
+	void encoder_worker(std::stop_token, size_t index);
 
 	struct
 	{
@@ -164,8 +180,6 @@ private:
 	}
 
 	int acquire_image();
-
-	void encoder_work(std::stop_token);
 
 	void send_video_stream_description();
 

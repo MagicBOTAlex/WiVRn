@@ -50,7 +50,14 @@ private:
 		vk::raii::CommandBuffer cmd = nullptr;
 		vk::raii::Buffer yuv = nullptr;
 		vk::raii::DeviceMemory mem = nullptr;
-		NV_ENC_REGISTERED_PTR nvenc_resource;
+		NV_ENC_REGISTERED_PTR nvenc_resource = nullptr;
+		// The mapped view of nvenc_resource for the frame currently being
+		// encoded. Unmapped right after the bitstream lock, as the API requires.
+		void * mapped_resource = nullptr;
+		NV_ENC_BUFFER_FORMAT mapped_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+		bool is_mapped = false;
+		CUexternalMemory extmem = nullptr;
+		int fd = -1;
 	};
 	std::array<in_t, num_slots> in;
 

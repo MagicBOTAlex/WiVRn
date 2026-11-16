@@ -85,7 +85,7 @@ public:
 	        std::weak_ptr<scenes::stream> scene,
 	        shard_accumulator * accumulator);
 
-	void push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
+	bool push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
 
 	void frame_completed(
 	        const wivrn::from_headset::feedback & feedback,

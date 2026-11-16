@@ -194,13 +194,14 @@ decoder::decoder(
 	        });
 }
 
-void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
+bool decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
 	if (frame_index != this->frame_index)
 		packet.clear();
 	for (const auto & d: data)
 		packet.insert(packet.end(), d.begin(), d.end());
 	this->frame_index = frame_index;
+	return true;
 }
 
 void decoder::frame_completed(const wivrn::from_headset::feedback & feedback, const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info)

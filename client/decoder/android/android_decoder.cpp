@@ -216,14 +216,33 @@ decoder::~decoder()
 	spdlog::info("decoder::~decoder");
 }
 
-void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
+bool decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
+	// Once a frame is dropped, discard the rest of it: submitting the tail of a
+	// bitstream as if it were a whole frame corrupts the decoder's reference
+	// state, which is unrecoverable with an infinite GOP.
+	if (frame_index == dropped_frame)
+		return false;
+	if (dropped_frame != UINT64_MAX)
+		dropped_frame = UINT64_MAX;
+
+	last_frame_index = frame_index;
+
 	if (current_input_buffer.data == nullptr)
 	{
 		// Never block the receive thread on the decoder: drop the frame instead.
 		auto buffer = input_buffers.try_pop();
 		if (not buffer)
-			return;
+		{
+			dropped_frame = frame_index;
+			auto n = frames_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n == 1 or n % 90 == 0)
+				spdlog::warn("decoder {}: no input buffer, dropped frame {} ({} dropped so far)",
+				             stream_index,
+				             frame_index,
+				             n);
+			return false;
+		}
 		current_input_buffer = std::move(*buffer);
 	}
 	else if (current_input_buffer.frame_index != frame_index)
@@ -237,8 +256,18 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 	{
 		if (current_input_buffer.data_size + sub_data.size() > current_input_buffer.capacity)
 		{
-			spdlog::error("data to decode is larger than decoder buffer, skipping frame");
-			return;
+			auto n = frames_oversize.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n == 1 or n % 90 == 0)
+				spdlog::error("decoder {}: frame {} is larger than the decoder buffer ({} > {}), dropping ({} so far)",
+				              stream_index,
+				              frame_index,
+				              current_input_buffer.data_size + sub_data.size(),
+				              current_input_buffer.capacity,
+				              n);
+			// Discard the whole frame rather than queueing a frame with a hole.
+			current_input_buffer.data_size = 0;
+			dropped_frame = frame_index;
+			return false;
 		}
 
 		memcpy(current_input_buffer.data + current_input_buffer.data_size, sub_data.data(), sub_data.size());
@@ -246,9 +275,10 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 	}
 
 	if (partial)
-		return;
+		return true;
 
 	queue_current();
+	return true;
 }
 
 void decoder::queue_current()
@@ -430,23 +460,35 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 
 	std::unique_lock lock(hbm_mutex);
 
+	// Cache hit first: the properties query is a driver round trip, and this
+	// runs on every frame. Comparing the whole driver-filled struct could also
+	// trip on padding and rebuild the conversion + clear the map every frame.
+	if (auto it = hardware_buffer_map.find(hardware_buffer); it != hardware_buffer_map.end())
+		return it->second;
+
 	AHardwareBuffer_Desc buffer_desc{};
 	AHardwareBuffer_describe(hardware_buffer, &buffer_desc);
 
 	auto [properties, format_properties] = device.getAndroidHardwareBufferPropertiesANDROID<vk::AndroidHardwareBufferPropertiesANDROID, vk::AndroidHardwareBufferFormatPropertiesANDROID>(*hardware_buffer);
 
-	if (!*ycbcr_sampler || memcmp(&ahb_format, &format_properties, sizeof(format_properties)))
+	if (!*ycbcr_sampler || ahb_format.externalFormat != format_properties.externalFormat)
 	{
+		if (*ycbcr_sampler)
+		{
+			spdlog::warn("decoder {}: output format changed ({} -> {}), rebuilding the YCbCr conversion",
+			             stream_index,
+			             ahb_format.externalFormat,
+			             format_properties.externalFormat);
+			// Keep the old conversion alive: image views created with it are
+			// still in use.
+			old_conversions.push_back(std::move(ycbcr_conversion));
+		}
 		memcpy(&ahb_format, &format_properties, sizeof(format_properties));
 		spdlog::info("decoded image size: {}x{}", buffer_desc.width, buffer_desc.height);
 		create_sampler(buffer_desc, ahb_format);
-		hardware_buffer_map.clear();
-		// TODO tell the reprojector to recreate the pipeline
+		// Do not clear hardware_buffer_map: those handles are still referenced
+		// by frames in flight, and their images stay valid.
 	}
-
-	auto it = hardware_buffer_map.find(hardware_buffer);
-	if (it != hardware_buffer_map.end())
-		return it->second;
 
 	vk::StructureChain img_info{
 	        vk::ImageCreateInfo{
@@ -527,17 +569,27 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 
 void decoder::on_media_error(AMediaCodec *, void * userdata, media_status_t error, int32_t actionCode, const char * detail)
 {
-	spdlog::warn("Mediacodec error: {}", detail);
+	spdlog::warn("Mediacodec error: {} (code {})", detail, int(error));
 
-	if (error == AMEDIA_ERROR_MALFORMED)
-	{
-		// Send an empty feedback packet, encoder will know we are lost
-		auto self = (decoder *)userdata;
-		if (auto scene = self->weak_scene.lock())
-			scene->send_feedback(
-			        wivrn::from_headset::feedback{
-			                .stream_index = self->stream_index});
-	}
+	// Any codec error leaves the decoder's reference state undefined. Flush it
+	// and ask for a keyframe: the feedback must carry a real frame index,
+	// otherwise the server's IDR handler ignores it (it only acts on
+	// frame_index >= last_ack).
+	auto self = (decoder *)userdata;
+	if (auto scene = self->weak_scene.lock())
+		scene->send_feedback(
+		        wivrn::from_headset::feedback{
+		                .frame_index = self->last_frame_index,
+		                .stream_index = self->stream_index,
+		                .sent_to_decoder = 0});
+
+	// Flush on the job thread: it owns all MediaCodec calls that can race with
+	// queueInputBuffer. The flush discards the corrupted reference state.
+	self->jobs.push([self]() {
+		if (auto mc = self->media_codec.get())
+			AMediaCodec_flush(mc);
+		return false;
+	});
 }
 void decoder::on_media_format_changed(AMediaCodec *, void * userdata, AMediaFormat *)
 {

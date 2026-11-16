@@ -931,7 +931,7 @@ void decoder::drain_capture()
 	}
 }
 
-void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
+bool decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
 	if (dropped_frame_index && *dropped_frame_index != frame_index)
 		dropped_frame_index.reset();
@@ -942,14 +942,14 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 	if (!assembling)
 	{
 		if (dropped_frame_index && *dropped_frame_index == frame_index)
-			return;
+			return false;
 
 		std::scoped_lock lock(output_mutex);
 		if (free_output_buffers.empty())
 		{
 			spdlog::warn("No free OUTPUT buffer for frame {}; dropping", frame_index);
 			dropped_frame_index = frame_index;
-			return;
+			return false;
 		}
 		const unsigned int index = free_output_buffers.back();
 		free_output_buffers.pop_back();
@@ -966,6 +966,7 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 		assembling->bytes_used += shard.size();
 	}
 	(void)partial;
+	return true;
 }
 
 void decoder::abandon_assembling_frame()

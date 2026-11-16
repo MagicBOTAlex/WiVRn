@@ -567,11 +567,13 @@ layer_squasher::do_layers(
 		if (all_layers_fov.angle_up > all_layers_fov.angle_down and
 		    all_layers_fov.angle_left < all_layers_fov.angle_right)
 		{
-			fovs[view] = all_layers_fov;
+			// The reference FOV must be measured before it is overwritten,
+			// otherwise w1/w2 is 1 by construction and the crop never happens.
 			auto w1 = tan(all_layers_fov.angle_right) - tan(all_layers_fov.angle_left);
 			auto h1 = tan(all_layers_fov.angle_up) - tan(all_layers_fov.angle_down);
 			auto w2 = tan(fovs[view].angle_right) - tan(fovs[view].angle_left);
 			auto h2 = tan(fovs[view].angle_up) - tan(fovs[view].angle_down);
+			fovs[view] = all_layers_fov;
 			viewports[view].w = std::max<uint32_t>(min_size.extent.w, viewports[view].w * w1 / w2);
 			viewports[view].h = std::max<uint32_t>(min_size.extent.h, viewports[view].h * h1 / h2);
 		}

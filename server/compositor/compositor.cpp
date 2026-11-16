@@ -310,8 +310,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	U_LOG_IFL_D(log_level, "frame %ld commit %d layers", frame.rendering.id, layer_accum.layer_count);
 
-	if (encode_request >= 0 // encoders have not picked up the previous frame
-	    or not session.connected() or not session.get_offset())
+	{
+		std::lock_guard lock(job_mutex);
+		if (jobs.size() >= images.size()) // every image is still being encoded
+		{
+			comp_frame_clear_locked(&frame.rendering);
+			return XRT_SUCCESS;
+		}
+	}
+	if (not session.connected() or not session.get_offset())
 	{
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
@@ -323,6 +330,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
+
+	// Any exception between here and submit_encode_job would otherwise leave
+	// this image busy forever (two such leaks and the stream silently dies).
+	struct busy_guard
+	{
+		std::atomic<bool> & busy;
+		bool armed = true;
+		~busy_guard()
+		{
+			if (armed)
+				busy = false;
+		}
+		void release()
+		{
+			armed = false;
+		}
+	} image_busy{images[i].busy};
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -352,7 +376,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			U_LOG_IFL_W(log_level, "compositor timeout waiting for the previous frame");
 		else
 		{
-			auto [res, ts] = query_pools[frame_parity ^ 1].getResults<uint64_t>(
+			// frame_parity is flipped below, so it still identifies the frame we
+			// just waited on.
+			auto [res, ts] = query_pools[frame_parity].getResults<uint64_t>(
 			        0,
 			        3,
 			        3 * sizeof(uint64_t),
@@ -555,9 +581,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        info.frame_id);
 	}
 
-	[[maybe_unused]] auto j = encode_request.exchange(i);
-	encode_request.notify_all();
-	assert(j == -1);
+	// Hand the frame to the per-encoder workers. The guard is disarmed only once
+	// the job owns the image.
+	if (not submit_encode_job(i))
+	{
+		U_LOG_W("failed to submit encode job for frame %ld", frame.rendering.id);
+	}
+	image_busy.release();
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -652,36 +682,88 @@ int compositor::acquire_image()
 	return -1;
 }
 
-void compositor::encoder_work(std::stop_token tok)
+bool compositor::submit_encode_job(int image)
 {
+	auto job = std::make_shared<encode_job>();
+	job->image = image;
+	job->frame_index = images[image].frame_index;
+	job->view_info = images[image].view_info;
+
+	int active = 0;
+	for (auto & encoder: encoders)
+	{
+		if (encoder->stream_idx < 2 or job->view_info.alpha)
+			active++;
+	}
+	if (active == 0)
+		return false;
+	job->remaining = active;
+
+	{
+		std::lock_guard lock(job_mutex);
+		job->epoch = next_job_epoch++;
+		jobs.push_back(job);
+	}
+	job_cv.notify_all();
+	return true;
+}
+
+void compositor::encoder_worker(std::stop_token tok, size_t index)
+{
+	uint64_t last_epoch = 0;
 	while (not tok.stop_requested())
 	{
-		auto req = encode_request.exchange(-1);
-		if (req < 0)
+		std::shared_ptr<encode_job> job;
 		{
-			encode_request.wait(req);
-			wivrn::trace::cpu_instant(wivrn::trace::cpu_track::compositor, "encoder_work wake", 0, 0);
-			continue;
+			std::unique_lock lock(job_mutex);
+			job_cv.wait(lock, [&] {
+				if (tok.stop_requested())
+					return true;
+				for (auto & candidate: jobs)
+					if (candidate->epoch > last_epoch)
+						return true;
+				return false;
+			});
+			if (tok.stop_requested())
+				return;
+			for (auto & candidate: jobs)
+			{
+				if (candidate->epoch > last_epoch)
+				{
+					job = candidate;
+					break;
+				}
+			}
 		}
+		if (not job)
+			continue;
+		last_epoch = job->epoch;
 
-		assert(req < images.size());
-		auto & image = images[req];
+		wivrn::trace::cpu_instant(wivrn::trace::cpu_track::compositor, "encoder_worker wake", 0, 0);
+		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, index, job->frame_index, "encode");
 
-		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
-
+		auto & encoder = encoders[index];
 		try
 		{
-			for (auto & encoder: encoders)
-			{
-				if (encoder->stream_idx < 2 or image.view_info.alpha)
-					encoder->encode(session, image.view_info, image.frame_index);
-			}
+			if (encoder->stream_idx < 2 or job->view_info.alpha)
+				encoder->encode(session, job->view_info, job->frame_index);
 		}
 		catch (std::exception & e)
 		{
-			U_LOG_W("encode error: %s", e.what());
+			// Per-encoder: a failure here must not prevent the other stream from
+			// being encoded (and from releasing its slot).
+			U_LOG_W("encode error on stream %d: %s", int(encoder->stream_idx), e.what());
 		}
-		image.busy = false;
+
+		if (job->remaining.fetch_sub(1) == 1)
+		{
+			images[job->image].busy = false;
+			{
+				std::lock_guard lock(job_mutex);
+				jobs.erase(std::remove(jobs.begin(), jobs.end(), job), jobs.end());
+			}
+			job_cv.notify_all();
+		}
 	}
 }
 
@@ -791,15 +873,19 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 
 	// Start the thread after everything is initialized
-	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};
+	for (size_t i = 0; i < encoder_threads.size(); ++i)
+		encoder_threads[i] = std::jthread{[this, i](std::stop_token t) { encoder_worker(t, i); }};
 }
 
 compositor::~compositor()
 {
 	u_var_remove_root(this);
-	encoder_thread.request_stop();
-	encode_request = -2;
-	encode_request.notify_all();
+	for (auto & thread: encoder_threads)
+		thread.request_stop();
+	job_cv.notify_all();
+	for (auto & thread: encoder_threads)
+		if (thread.joinable())
+			thread.join();
 	comp_base * c_base = this;
 	comp_swapchain_shared_garbage_collect(&cscs);
 	comp_swapchain_shared_destroy(&cscs, &c_base->vk);

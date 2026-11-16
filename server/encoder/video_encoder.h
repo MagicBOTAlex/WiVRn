@@ -71,7 +71,7 @@ private:
 	public:
 		void push(data &&);
 		static std::shared_ptr<sender> get();
-		void wait_idle(video_encoder *);
+		bool wait_idle(video_encoder *, std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
 	};
 
 public:

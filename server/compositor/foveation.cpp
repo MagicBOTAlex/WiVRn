@@ -282,8 +282,11 @@ static void fill_param_2d(
 	auto [a, b] = solve_foveation(scale, c);
 
 	uint16_t last = 0;
-	std::vector<uint16_t> left; // index 0: 1:1 ratio, then 2:1 etc.
-	std::vector<uint16_t> right;
+	// Reused across calls: this runs 4x per frame on the xrEndFrame thread.
+	static thread_local std::vector<uint16_t> left; // index 0: 1:1 ratio, then 2:1 etc.
+	static thread_local std::vector<uint16_t> right;
+	left.clear();
+	right.clear();
 	for (size_t i = 1; i < foveated_dim; ++i)
 	{
 		double u = (i * 2.) / foveated_dim - 1;
@@ -317,25 +320,25 @@ static void fill_param_2d(
 namespace wivrn
 {
 
-void foveation::compute_params()
+void foveation::compute_params(const P & state)
 {
 	for (size_t i = 0; i < 2; ++i)
 	{
-		const auto & fov = last.fovs[i];
+		const auto & fov = state.fovs[i];
 
-		size_t extent_w = std::abs(last.src[i].extent.w);
+		size_t extent_w = std::abs(state.src[i].extent.w);
 		if (foveated_size.width < extent_w)
 		{
-			const float center = angles_to_center(last.foveation_angles[i].x, fov.angle_left, fov.angle_right);
+			const float center = angles_to_center(state.foveation_angles[i].x, fov.angle_left, fov.angle_right);
 			fill_param_2d(center, foveated_size.width, extent_w, params[i].x);
 		}
 		else
 			params[i].x = {uint16_t(extent_w)};
 
-		size_t extent_h = std::abs(last.src[i].extent.h);
+		size_t extent_h = std::abs(state.src[i].extent.h);
 		if (foveated_size.height < extent_h)
 		{
-			const float center = angles_to_center(last.foveation_angles[i].y, fov.angle_up, fov.angle_down);
+			const float center = angles_to_center(state.foveation_angles[i].y, fov.angle_up, fov.angle_down);
 			fill_param_2d(center, foveated_size.height, extent_h, params[i].y);
 		}
 		else
@@ -424,27 +427,32 @@ void foveation::update_ubo(
         std::array<xrt_rect, 2> src_rect,
         std::array<xrt_fov, 2> src_fov)
 {
-	// Check if the last value is still valid
-	std::lock_guard lock(mutex);
-	if (last.flip_y == flip_y and
-	    last.src[0] == src_rect[0] and
-	    last.src[1] == src_rect[1] and
-	    last.fovs[0] == src_fov[0] and
-	    last.fovs[1] == src_fov[1] and
-	    last.foveation_angles[0].x == foveation_angles[0].x and
-	    last.foveation_angles[0].y == foveation_angles[0].y and
-	    last.foveation_angles[1].x == foveation_angles[1].x and
-	    last.foveation_angles[1].y == foveation_angles[1].y)
-		return;
+	// Snapshot under the lock, then compute outside it: the whole computation is
+	// ~100 us and the network thread needs this mutex to deliver new angles.
+	P snapshot;
+	{
+		std::lock_guard lock(mutex);
+		if (last.flip_y == flip_y and
+		    last.src[0] == src_rect[0] and
+		    last.src[1] == src_rect[1] and
+		    last.fovs[0] == src_fov[0] and
+		    last.fovs[1] == src_fov[1] and
+		    last.foveation_angles[0].x == foveation_angles[0].x and
+		    last.foveation_angles[0].y == foveation_angles[0].y and
+		    last.foveation_angles[1].x == foveation_angles[1].x and
+		    last.foveation_angles[1].y == foveation_angles[1].y)
+			return;
 
-	last = {
-	        .flip_y = flip_y,
-	        .src = {src_rect[0], src_rect[1]},
-	        .fovs = {src_fov[0], src_fov[1]},
-	        .foveation_angles = foveation_angles,
-	};
+		snapshot = {
+		        .flip_y = flip_y,
+		        .src = {src_rect[0], src_rect[1]},
+		        .fovs = {src_fov[0], src_fov[1]},
+		        .foveation_angles = foveation_angles,
+		};
+		last = snapshot;
+	}
 
-	compute_params();
+	compute_params(snapshot);
 
 	ubo_data ubo;
 	for (size_t view = 0; view < 2; ++view)
@@ -489,8 +497,8 @@ void foveation::update_ubo(
 		         extent,
 		         foveated_size.height);
 	}
+	// One copy: vmaCopyMemoryToAllocation already writes through the mapping.
 	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffer, 0, sizeof(ubo));
-	std::memcpy(gpu_buffer.data<ubo_data>(), &ubo, sizeof(ubo));
 }
 
 std::array<to_headset::foveation_parameter, 2> foveation::foveate(

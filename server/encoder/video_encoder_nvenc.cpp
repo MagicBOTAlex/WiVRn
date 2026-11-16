@@ -18,7 +18,9 @@
  */
 
 #include "video_encoder_nvenc.h"
+
 #include "encoder_settings.h"
+#include <unistd.h>
 
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -117,6 +119,10 @@ static void check_preset_guid_supported(std::shared_ptr<video_encoder_nvenc_shar
 		throw std::runtime_error("nvenc: Internal error. GPU doesn't support selected encoder preset.");
 	}
 }
+
+// Frames between forced IDRs. 4 s at 90 Hz. Recovery safety net: see the
+// comment where config.gopLength is set.
+static constexpr uint32_t gop_frames = 360;
 
 static void check_profile_guid_supported(std::shared_ptr<video_encoder_nvenc_shared_state> shared_state, void * session_handle, GUID encodeGUID, GUID profileGUID, std::string err_msg = "GPU doesn't support selected encoding profile.")
 {
@@ -221,7 +227,13 @@ video_encoder_nvenc::video_encoder_nvenc(
 	config.rcParams.enableAQ = 1;
 	config.rcParams.enableNonRefP = 1;
 
-	config.gopLength = NVENC_INFINITE_GOPLENGTH;
+	// A bounded GOP is the only thing that can repair a lost reference frame:
+	// NVENC's intra refresh is a no-op for AV1 (verified on the wire: no
+	// SWITCH/INTRA_ONLY frames, primary_ref_frame stays 0), and with an
+	// infinite GOP the feedback path is the sole recovery mechanism. A 4 s
+	// period converts an undetected corruption into a short glitch instead of
+	// a permanently green stream.
+	config.gopLength = gop_frames;
 	config.frameIntervalP = 1;
 
 	NV_ENC_BIT_DEPTH bitDepth = NV_ENC_BIT_DEPTH_8;
@@ -246,9 +258,12 @@ video_encoder_nvenc::video_encoder_nvenc(
 		}
 	}
 
+	// Intra refresh requires gopLength == NVENC_INFINITE_GOPLENGTH, and NVENC
+	// does not emit refresh frames for AV1 anyway. A finite GOP is used
+	// instead, so this is disabled. Kept for reference.
 	const uint32_t intra_refresh_period = 100;
 	const uint32_t intra_refresh_cnt = 50;
-	auto set_intra_refresh = [&](auto & codec_config) {
+	[[maybe_unused]] auto set_intra_refresh = [&](auto & codec_config) {
 		NV_ENC_CAPS_PARAM cap_param{
 		        .version = NV_ENC_CAPS_PARAM_VER,
 		        .capsToQuery = NV_ENC_CAPS_SUPPORT_INTRA_REFRESH,
@@ -275,8 +290,8 @@ video_encoder_nvenc::video_encoder_nvenc(
 			config.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 			config.encodeCodecConfig.h264Config.maxNumRefFrames = 0;
 			config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = 1;
-			config.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-			set_intra_refresh(config.encodeCodecConfig.h264Config);
+			config.encodeCodecConfig.h264Config.idrPeriod = gop_frames;
+			// set_intra_refresh(config.encodeCodecConfig.h264Config);
 
 			break;
 		case video_codec::h265:
@@ -292,8 +307,8 @@ video_encoder_nvenc::video_encoder_nvenc(
 			config.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
 			config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = 0;
 			config.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag = 1;
-			config.encodeCodecConfig.hevcConfig.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-			set_intra_refresh(config.encodeCodecConfig.hevcConfig);
+			config.encodeCodecConfig.hevcConfig.idrPeriod = gop_frames;
+			// set_intra_refresh(config.encodeCodecConfig.hevcConfig);
 
 			break;
 		case video_codec::av1:
@@ -308,8 +323,8 @@ video_encoder_nvenc::video_encoder_nvenc(
 
 			config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
 			config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = 0;
-			config.encodeCodecConfig.av1Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-			set_intra_refresh(config.encodeCodecConfig.av1Config);
+			config.encodeCodecConfig.av1Config.idrPeriod = gop_frames;
+			// set_intra_refresh(config.encodeCodecConfig.av1Config);
 
 			break;
 		case video_codec::raw:
@@ -379,9 +394,9 @@ video_encoder_nvenc::video_encoder_nvenc(
 		});
 
 		CUdeviceptr frame;
+		CUexternalMemory extmem = nullptr;
 		CU_CHECK(shared_state->cuda_fn->cuCtxPushCurrent(shared_state->cuda));
 		{
-			CUexternalMemory extmem;
 			CUDA_EXTERNAL_MEMORY_HANDLE_DESC mem_handle_params{
 			        .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
 			        .handle = {.fd = fd},
@@ -410,6 +425,8 @@ video_encoder_nvenc::video_encoder_nvenc(
 		};
 		NVENC_CHECK(shared_state->fn.nvEncRegisterResource(session_handle, &resource_params));
 		i.nvenc_resource = resource_params.registeredResource;
+		i.extmem = extmem;
+		i.fd = fd;
 	}
 	CU_CHECK(shared_state->cuda_fn->cuCtxPopCurrent(NULL));
 
@@ -419,7 +436,31 @@ video_encoder_nvenc::video_encoder_nvenc(
 video_encoder_nvenc::~video_encoder_nvenc()
 {
 	if (session_handle)
+	{
+		for (auto & i: in)
+		{
+			if (i.is_mapped)
+				shared_state->fn.nvEncUnmapInputResource(session_handle, i.mapped_resource);
+			if (i.nvenc_resource)
+				shared_state->fn.nvEncUnregisterResource(session_handle, i.nvenc_resource);
+		}
+		if (shared_state and shared_state->cuda_fn and shared_state->cuda)
+		{
+			if (shared_state->cuda_fn->cuCtxPushCurrent(shared_state->cuda) == CUDA_SUCCESS)
+			{
+				for (auto & i: in)
+					if (i.extmem)
+						shared_state->cuda_fn->cuDestroyExternalMemory(i.extmem);
+				shared_state->cuda_fn->cuCtxPopCurrent(NULL);
+			}
+		}
+		if (outputBuffer)
+			shared_state->fn.nvEncDestroyBitstreamBuffer(session_handle, outputBuffer);
 		shared_state->fn.nvEncDestroyEncoder(session_handle);
+	}
+	for (auto & i: in)
+		if (i.fd >= 0)
+			::close(i.fd);
 }
 
 void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
@@ -546,8 +587,27 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 	NV_ENC_MAP_INPUT_RESOURCE inp_resource_params{
 	        .version = NV_ENC_MAP_INPUT_RESOURCE_VER,
 	        .registeredResource = in[slot].nvenc_resource};
-
 	NVENC_CHECK(shared_state->fn.nvEncMapInputResource(session_handle, &inp_resource_params));
+	in[slot].mapped_resource = inp_resource_params.mappedResource;
+	in[slot].mapped_format = inp_resource_params.mappedBufferFmt;
+	in[slot].is_mapped = true;
+
+	// The API requires the input to be unmapped once the bitstream is locked;
+	// leaking the mapping (as before) leaks a driver object per frame.
+	struct unmap_guard
+	{
+		video_encoder_nvenc & self;
+		uint8_t slot;
+		~unmap_guard()
+		{
+			auto & i = self.in[slot];
+			if (i.is_mapped)
+			{
+				self.shared_state->fn.nvEncUnmapInputResource(self.session_handle, i.mapped_resource);
+				i.is_mapped = false;
+			}
+		}
+	} unmap{*this, slot};
 
 	NV_ENC_PIC_PARAMS frame_params{
 	        .version = NV_ENC_PIC_PARAMS_VER,
@@ -557,9 +617,9 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 	        .encodePicFlags = 0,
 	        .frameIdx = 0,
 	        .inputTimeStamp = 0,
-	        .inputBuffer = inp_resource_params.mappedResource,
+	        .inputBuffer = in[slot].mapped_resource,
 	        .outputBitstream = outputBuffer,
-	        .bufferFmt = inp_resource_params.mappedBufferFmt,
+	        .bufferFmt = in[slot].mapped_format,
 	        .pictureStruct = NV_ENC_PIC_STRUCT_FRAME,
 	};
 

@@ -59,9 +59,12 @@ video_encoder::sender::sender() :
 			        else
 				        d = &pending.front();
 		        }
-		        if (d and not d->span.empty())
+		        if (d)
 		        {
-			        d->encoder->SendData(d->span, true, d->prefer_control);
+			        if (not d->span.empty())
+				        d->encoder->SendData(d->span, true, d->prefer_control);
+			        // Pop even when the span is empty: leaving it at the head
+			        // spins this thread at 100% and makes wait_idle hang forever.
 			        std::unique_lock lock(mutex);
 			        pending.pop_front();
 			        cv.notify_all();
@@ -81,11 +84,16 @@ void video_encoder::sender::push(data && d)
 	cv.notify_all();
 }
 
-void video_encoder::sender::wait_idle(video_encoder * encoder)
+bool video_encoder::sender::wait_idle(video_encoder * encoder, std::chrono::milliseconds timeout)
 {
 	std::unique_lock lock(mutex);
+	auto deadline = std::chrono::steady_clock::now() + timeout;
 	while (std::ranges::any_of(pending, [=](auto & data) { return data.encoder == encoder; }))
-		cv.wait_for(lock, std::chrono::milliseconds(100));
+	{
+		if (cv.wait_until(lock, deadline) == std::cv_status::timeout)
+			return not std::ranges::any_of(pending, [=](auto & data) { return data.encoder == encoder; });
+	}
+	return true;
 }
 
 std::shared_ptr<video_encoder::sender> video_encoder::sender::get()
@@ -268,8 +276,14 @@ void video_encoder::encode(wivrn_session & cnx,
 	if (state[encode_slot] == skip)
 		return;
 
-	if (shared_sender)
-		shared_sender->wait_idle(this);
+	if (shared_sender and not shared_sender->wait_idle(this, std::chrono::milliseconds(500)))
+	{
+		// The sender is stuck (congested link). Skipping the encode keeps the
+		// single bitstream buffer from being overwritten while it is still being
+		// sent; the client sees a gap and asks for an IDR.
+		U_LOG_W("stream %d: sender busy, dropping frame %ld", int(stream_idx), frame_index);
+		return;
+	}
 	this->cnx = &cnx;
 	clock = cnx.get_offset();
 

@@ -508,11 +508,23 @@ bool wivrn_session::connected()
 	return connection->is_active();
 }
 
+static float safe_fps(uint32_t rate, uint32_t divider)
+{
+	// fps_divider comes from the client and is used as a divisor all the way
+	// down to pacer::predict, where a zero frame duration is a division by zero
+	// (SIGFPE) in the server process.
+	if (rate == 0)
+		return 0;
+	if (divider == 0)
+		divider = 1;
+	return float(rate) / float(divider);
+}
+
 float wivrn_session::default_fps()
 {
 	auto s = settings.lock();
 	if (s->preferred_refresh_rate)
-		return s->preferred_refresh_rate / s->fps_divider;
+		return safe_fps(s->preferred_refresh_rate, s->fps_divider);
 	return headset_info.available_refresh_rates.back();
 }
 
@@ -539,7 +551,7 @@ void wivrn_session::operator()(const from_headset::settings_changed & settings)
 		compositor.set_bitrate(settings.bitrate_bps);
 
 	if (settings.preferred_refresh_rate != 0)
-		compositor.set_framerate(settings.preferred_refresh_rate / settings.fps_divider);
+		compositor.set_framerate(safe_fps(settings.preferred_refresh_rate, settings.fps_divider));
 
 	if (not settings.mirror_gamepad and uinput_handler)
 		uinput_handler->destroy_gamepad();
@@ -941,7 +953,7 @@ void wivrn_session::operator()(from_headset::user_presence_changed && event)
 void wivrn_session::operator()(from_headset::refresh_rate_changed && event)
 {
 	auto locked = settings.lock();
-	compositor.set_framerate(event.to / locked->fps_divider);
+	compositor.set_framerate(safe_fps(event.to, locked->fps_divider));
 	push_event(
 	        {
 	                .display = {

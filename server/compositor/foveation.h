@@ -61,8 +61,9 @@ class foveation
 	};
 	P last;
 
-	// must hold lock on mutex to call it
-	void compute_params();
+	// Computes params from a snapshot; does not touch shared state, so it can
+	// run outside the mutex (the network thread needs it to deliver angles).
+	void compute_params(const P & state);
 
 	void update_ubo(
 	        vk::raii::CommandBuffer & cmd,

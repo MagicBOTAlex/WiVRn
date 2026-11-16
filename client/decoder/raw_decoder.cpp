@@ -184,7 +184,7 @@ raw_decoder::raw_decoder(
 	}
 }
 
-void raw_decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
+bool raw_decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
 	if (frame_index != current_frame)
 	{
@@ -196,6 +196,7 @@ void raw_decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t f
 		memcpy(input_pos, item.data(), item.size_bytes());
 		input_pos += item.size();
 	}
+	return true;
 }
 
 void raw_decoder::frame_completed(

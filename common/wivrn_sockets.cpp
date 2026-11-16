@@ -72,6 +72,11 @@ wivrn::UDP::UDP()
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	// Never block the sender on a congested link: a datagram that does not fit
+	// in the socket buffer is dropped, which the shard/IDR path already handles.
+	// Blocking here would stall the encoder thread and queue hundreds of
+	// milliseconds of stale video.
+	fcntl(fd, F_SETFL, O_NONBLOCK);
 }
 
 wivrn::UDP::UDP(int fd)
@@ -137,11 +142,14 @@ void wivrn::UDP::set_send_buffer_size(int size)
 
 void wivrn::UDP::set_tos(int tos)
 {
-	int err = setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-	if (err == -1)
-	{
-		throw std::system_error{errno, std::generic_category()};
-	}
+	// The socket is AF_INET6. IP_TOS only applies to v4-mapped peers, so set
+	// IPV6_TCLASS as well, and do not fail the connection if the kernel refuses.
+	// Best effort: a missing IPv6 traffic class support must not break the
+	// connection.
+	if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0)
+		fprintf(stderr, "wivrn: setsockopt(IP_TOS): %s\n", strerror(errno));
+	if (setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos)) < 0)
+		fprintf(stderr, "wivrn: setsockopt(IPV6_TCLASS): %s\n", strerror(errno));
 }
 
 void wivrn::TCP::init()
@@ -379,6 +387,8 @@ size_t wivrn::UDP::send_raw(serialization_packet && packet)
 
 	if (ssize_t sent = ::writev(fd, iovecs.data(), iovecs.size()); sent >= 0)
 		return sent;
+	if (errno == EAGAIN or errno == EWOULDBLOCK or errno == ENOBUFS)
+		return 0; // congested: drop this datagram
 	throw std::system_error{errno, std::generic_category()};
 }
 

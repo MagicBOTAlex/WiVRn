@@ -166,7 +166,7 @@ public:
 	        shard_accumulator * accumulator);
 	~decoder() override;
 
-	void push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
+	bool push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
 	void frame_completed(
 	        const wivrn::from_headset::feedback & feedback,
 	        const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info) override;

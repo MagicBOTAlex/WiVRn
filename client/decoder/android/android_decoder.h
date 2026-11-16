@@ -73,6 +73,10 @@ private:
 	vk::AndroidHardwareBufferFormatPropertiesANDROID ahb_format;
 	vk::raii::SamplerYcbcrConversion ycbcr_conversion = nullptr;
 	vk::raii::Sampler ycbcr_sampler = nullptr;
+	// A conversion must outlive every image view created with it. Output format
+	// changes are rare, so keeping the old ones for the session is the cheap
+	// correct thing to do.
+	std::vector<vk::raii::SamplerYcbcrConversion> old_conversions;
 
 	std::mutex hbm_mutex;
 	std::shared_ptr<AImageReader> image_reader;
@@ -118,6 +122,13 @@ private:
 	// Queue the accumulated input buffer to MediaCodec and take a new one.
 	void queue_current();
 
+	// Frame that has been dropped: its remaining shards are discarded, and the
+	// drop is reported to the server so it can request an IDR.
+	uint64_t dropped_frame = UINT64_MAX;
+	uint64_t last_frame_index = 0;
+	std::atomic<uint64_t> frames_dropped{0};
+	std::atomic<uint64_t> frames_oversize{0};
+
 	void create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format);
 	std::shared_ptr<mapped_hardware_buffer> map_hardware_buffer(AImage *);
 
@@ -130,7 +141,7 @@ public:
 	        shard_accumulator * accumulator);
 	~decoder();
 
-	void push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
+	bool push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial) override;
 
 	void frame_completed(
 	        const wivrn::from_headset::feedback & feedback,
