@@ -34,7 +34,11 @@
             pkgs.util-linux
           ];
 
-          package = pkgs.enableDebugging (
+          # Release build: the nixpkgs default build type. enableDebugging (the
+          # old wrapper) forces -Og, which is ~2.4x slower on the per-pixel hot
+          # paths and makes the packaged server unusable for streaming.
+          # `packages.debug` still provides the debug build when needed.
+          package =
             pkgs.wivrn.overrideAttrs (
               finalAttrs: oldAttrs: {
                 # Filter the directories and files we don't need to keep to avoid needless rebuilds
@@ -77,19 +81,42 @@
 
                 buildInputs = oldAttrs.buildInputs ++ extraBuildInputs;
                 nativeBuildInputs = oldAttrs.nativeBuildInputs ++ extraNativeBuildInputs;
+
+                # NixOS patch: make the packaged server work on NVIDIA.
+                # NVENC dlopen()s libcuda/libnvidia-encode at runtime and NixOS
+                # does not put the driver libraries on the default search path.
+                # The addDriverRunpath hook does not reach these binaries (their
+                # rpath ends up without a driver directory), so patch the real
+                # binaries and the monado libraries -- not the small launcher.
+                # Without this the server starts and then reports
+                # "nvenc not supported" for every codec.
+                postFixup = (oldAttrs.postFixup or "") + ''
+                  for f in $out/bin/.wivrn-server-wrapped $out/bin/.wivrn-dashboard-wrapped $out/lib/wivrn/*.so*; do
+                    if [ -f "$f" ]; then
+                      patchelf --add-rpath /run/opengl-driver/lib "$f" || true
+                    fi
+                  done
+                '';
+
                 cmakeFlags = (lib.filter (flag: !lib.hasInfix "GIT_" flag) oldAttrs.cmakeFlags) ++ [
                   (lib.cmakeFeature "GIT_DESC" "nightly")
                   (lib.cmakeFeature "GIT_COMMIT" "nightly")
+                  # nixpkgs ships WiVRn VAAPI-only, which cannot encode on an
+                  # NVIDIA host at all. Enable NVENC and drop VAAPI so the
+                  # packaged server and the AppImage built from it work.
+                  (lib.cmakeBool "WIVRN_USE_NVENC" true)
+                  (lib.cmakeBool "WIVRN_USE_VAAPI" false)
                 ];
               }
-            )
-          );
+            );
+          debugPackage = pkgs.enableDebugging package;
         in
         {
           formatter = pkgs.nixfmt;
 
           packages = {
             default = package;
+            debug = debugPackage;
             dissector = package.overrideAttrs (oldAttrs: {
               pname = "wivrn-dissector";
               cmakeFlags = (lib.filter (flag: !(lib.hasPrefix "-DWIVRN_BUILD" flag)) oldAttrs.cmakeFlags) ++ [
